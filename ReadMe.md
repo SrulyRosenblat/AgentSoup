@@ -10,14 +10,6 @@ AgentSoup is a lightweight Python library for turning regular functions into str
 
 ---
 
-## 🔧 Installation
-
-```bash
-pip install agentsoup
-```
-
----
-
 ## 🧠 Why AgentSoup?
 
 * 🥄 **Simple to start** – just decorate a function and return a prompt.
