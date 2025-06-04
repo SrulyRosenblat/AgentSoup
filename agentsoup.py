@@ -130,7 +130,7 @@ class AgentSystemPrompt(SystemMessage):
         if len(tools) > 0 and "{tools}" not in prompt:
             raise ValueError("Prompt must contain {tools} if tools are provided")
 
-        super().__init__([Text(prompt.format(tools=tools))])
+        super().__init__([Text(prompt.format(tools=self._format_tools(tools)))])
     def _format_tools(self, tools: list[Function]):
         text = "```\n"
         for tool in tools:
@@ -182,9 +182,9 @@ def llm(model="gpt-4o-mini", **llm_kwargs):
             function_result = f(*args, **kwargs)
             if type(function_result) == str:
                 messages = [UserMessageText(function_result)]
-            elif type(function_result) == Message:
+            elif isinstance(function_result, Message):
                 messages = [function_result]
-            elif type(function_result) == list:
+            elif isinstance(function_result, list):
                 messages = function_result
             else:
                 raise ValueError(f"Unsupported return type: {type(function_result)}")
