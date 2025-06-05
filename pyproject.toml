@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentsoup"
+version = "0.1.0"
+description = "Mix prompts, models, and logic — cook up LLM-powered functions with ease."
+readme = {file = "README.md", content-type = "text/markdown"}
+authors = [{name = "Sruly Rosenblat", email = "SrulyRosenblat@gmail.com"}]
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "litellm",
+    "pydantic",
+]
+
+[project.urls]
+Homepage = "https://github.com/SrulyRosenblat/AgentSoup"

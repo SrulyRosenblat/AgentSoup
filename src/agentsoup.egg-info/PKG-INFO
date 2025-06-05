@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: agentsoup
+Version: 0.1.0
+Summary: Mix prompts, models, and logic — cook up LLM-powered functions with ease.
+Author-email: Sruly Rosenblat <SrulyRosenblat@gmail.com>
+License: MIT
+Project-URL: Homepage, https://example.com
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: litellm
+Requires-Dist: pydantic
+
 
 
 # 🥣 AgentSoup
@@ -5,6 +17,12 @@
 **Mix prompts, models, and logic — cook up LLM-powered functions with ease.**
 
 AgentSoup is a lightweight Python library for turning regular functions into structured, prompt-driven LLM tools. It’s flexible enough for creative or structured outputs, while keeping your code readable and maintainable.
+
+## Installation
+
+```
+pip install agentsoup
+```
 
 > ✨ Built on top of [`litellm`](https://github.com/BerriAI/litellm), `pydantic`, and composable message objects.
 
