@@ -6,6 +6,12 @@
 
 AgentSoup is a lightweight Python library for turning regular functions into structured, prompt-driven LLM tools. It’s flexible enough for creative or structured outputs, while keeping your code readable and maintainable.
 
+## Installation
+
+```
+pip install agentsoup
+```
+
 > ✨ Built on top of [`litellm`](https://github.com/BerriAI/litellm), `pydantic`, and composable message objects.
 
 ---
