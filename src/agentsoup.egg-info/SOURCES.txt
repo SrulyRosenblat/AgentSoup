@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/agentsoup/__init__.py
+src/agentsoup.egg-info/PKG-INFO
+src/agentsoup.egg-info/SOURCES.txt
+src/agentsoup.egg-info/dependency_links.txt
+src/agentsoup.egg-info/requires.txt
+src/agentsoup.egg-info/top_level.txt
