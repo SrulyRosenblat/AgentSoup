@@ -63,6 +63,29 @@ def _store_output(step_state: dict, value):
         step_state["output_repr"] = repr(value)[:10_000]
 
 
+def _call_step(step_name: str, fn, prev_value, outputs: dict):
+    """Bind a step's parameters: a param named after an earlier step gets that
+    step's output; one remaining required param gets the previous step's output
+    (the pipeline input, for the first step)."""
+    kwargs = {}
+    unbound = []
+    for pname, p in inspect.signature(fn).parameters.items():
+        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if pname in outputs:
+            kwargs[pname] = outputs[pname]
+        elif p.default is inspect.Parameter.empty:
+            unbound.append(pname)
+    if len(unbound) > 1:
+        raise ValueError(
+            f"Step '{step_name}' has multiple unbound parameters {unbound}; "
+            "name them after earlier steps or give them defaults"
+        )
+    if unbound:
+        kwargs[unbound[0]] = prev_value
+    return fn(**kwargs)
+
+
 class PipelineResult(NamedTuple):
     run_id: str
     status: str
@@ -144,6 +167,7 @@ class Pipeline:
         save()
         emit("run_started")
         value = input
+        outputs = {}  # step name -> output, for name-based parameter wiring
         for i, (meta, fn) in enumerate(self.steps):
             step_state = state["steps"][i]
             step_state.update(status="running", started_at=_now())
@@ -151,8 +175,8 @@ class Pipeline:
             save()
             emit("step_started", step_state)
             try:
-                takes_arg = len(inspect.signature(fn).parameters) >= 1
-                value = fn(value) if takes_arg else fn()
+                value = _call_step(meta["name"], fn, value, outputs)
+                outputs[meta["name"]] = value
             except Exception as e:
                 step_state.update(
                     status="failed", finished_at=_now(),

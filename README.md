@@ -114,6 +114,16 @@ def draft(outline: str) -> str:
     return "Write a full draft from this outline:", outline
 ```
 
+Steps can also pull **any earlier step's output by name** — name a parameter after a step and it receives that step's result; one leftover required parameter still gets the previous step's output:
+
+```python
+@step
+def publish(draft, outline):        # gets draft's AND outline's outputs
+    return {"outline": outline, "article": draft}
+```
+
+(`@step(name="...")` renames a step; `@step(order=n)` overrides run order.)
+
 Run it from Python or the CLI:
 
 ```bash

@@ -213,3 +213,60 @@ def bad(x=None):
     path = write_pipeline(tmp_path, src)
     assert main(["run", path, "--state-dir", str(tmp_path / "runs")]) == 1
     assert "failed: ValueError: broken" in capsys.readouterr().out
+
+
+def test_steps_receive_earlier_outputs_by_name(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def seed(x=None):
+    return 2
+
+@step
+def grow(seed):
+    return seed * 10
+
+@step
+def report(x, seed):
+    return {"seed": seed, "grown": x}
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    result = pipeline.run(state_dir=tmp_path / "runs")
+    # `seed` params got seed's output; `x` (unmatched) got the previous step's output
+    assert result.output == {"seed": 2, "grown": 20}
+
+
+def test_named_wiring_respects_step_rename(tmp_path):
+    src = """
+from agentsoup import step
+
+@step(name="load")
+def whatever(x=None):
+    return "data"
+
+@step
+def use(load):
+    return load + "!"
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    assert pipeline.run(state_dir=tmp_path / "runs").output == "data!"
+
+
+def test_multiple_unbound_params_raise(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def one(x=None):
+    return 1
+
+@step
+def bad(a, b):
+    return a + b
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    with pytest.raises(ValueError, match="multiple unbound parameters"):
+        pipeline.run(state_dir=tmp_path / "runs", run_id="r1")
+    state = load_run(tmp_path / "runs" / "r1.json")
+    assert state["status"] == "failed"
