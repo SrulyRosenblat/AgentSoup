@@ -85,10 +85,10 @@ def deep_research(topic: str) -> Report:
 
 if __name__ == "__main__":
     topic = sys.argv[1] if len(sys.argv) > 1 else "octopus intelligence"
-    with track() as run:                                   # every agent call recorded
+    with track() as run_id:                                # every agent call recorded
         report = deep_research(topic)
     print(report.title, "\n")
     print(report.summary, "\n")
     for section in report.sections:
         print(" -", section)
-    print("\nrun state:", run.state_path)
+    print(f"\nrun state: .agentsoup/runs/{run_id}.json")

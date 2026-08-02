@@ -1,9 +1,10 @@
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
-from agentsoup import list_runs, llm, load_run, track
+from agentsoup import llm, state_file, track, webhook
 from tests.conftest import text_response
 
 
@@ -16,7 +17,11 @@ def _content_fake(monkeypatch, reply):
     monkeypatch.setattr(litellm, "completion", completion)
 
 
-def test_track_records_calls_in_a_plain_function_pipeline(monkeypatch, tmp_path):
+def read_state(state_dir, run_id) -> dict:
+    return json.loads((Path(state_dir) / f"{run_id}.json").read_text())
+
+
+def test_state_file_records_a_plain_function_pipeline(monkeypatch, tmp_path):
     _content_fake(monkeypatch, lambda t: t.upper())
 
     @llm(model="m")
@@ -30,34 +35,39 @@ def test_track_records_calls_in_a_plain_function_pipeline(monkeypatch, tmp_path)
     def pipeline(topic):  # a pipeline is just a function
         return draft(outline(topic))
 
-    with track(run_id="r1", state_dir=tmp_path) as run:
+    with track(state_file(tmp_path), run_id="r1"):
         result = pipeline("fish")
 
     assert result == "DRAFT OUTLINE FISH"
-    state = load_run(run.state_path)
+    state = read_state(tmp_path, "r1")
     assert state["status"] == "done"
     assert [(c["name"], c["status"]) for c in state["calls"]] == [("outline", "done"), ("draft", "done")]
     assert state["calls"][0]["output"] == "OUTLINE FISH"
     assert state["calls"][0]["duration_s"] is not None
 
 
-def test_track_records_parallel_map_calls(monkeypatch, tmp_path):
+def test_event_sequence_and_call_ids(monkeypatch, tmp_path):
     _content_fake(monkeypatch, lambda t: t.upper())
+    events = []
 
     @llm(model="m")
     def shout(w: str) -> str:
         return w
 
-    with track(run_id="r1", state_dir=tmp_path) as run:
+    with track(events.append, run_id="r1"):
         assert shout.map(["a", "b", "c"]) == ["A", "B", "C"]
 
-    state = load_run(run.state_path)
-    assert len(state["calls"]) == 3
-    assert {c["output"] for c in state["calls"]} == {"A", "B", "C"}
-    assert all(c["status"] == "done" for c in state["calls"])
+    names = [e["event"] for e in events]
+    assert names[0] == "run_started" and names[-1] == "run_finished"
+    starts = [e for e in events if e["event"] == "call_started"]
+    finishes = [e for e in events if e["event"] == "call_finished"]
+    assert {e["call_id"] for e in starts} == {0, 1, 2}
+    assert {e["call_id"] for e in finishes} == {0, 1, 2}  # ids correlate under parallelism
+    assert all(e["run_id"] == "r1" for e in events)
+    assert {e["output"] for e in finishes} == {"A", "B", "C"}
 
 
-def test_track_marks_failures_and_reraises(monkeypatch, tmp_path):
+def test_failure_marks_run_and_reraises(monkeypatch, tmp_path):
     import litellm
 
     def explode(**kwargs):
@@ -70,16 +80,28 @@ def test_track_marks_failures_and_reraises(monkeypatch, tmp_path):
         return q
 
     with pytest.raises(RuntimeError, match="provider down"):
-        with track(run_id="r1", state_dir=tmp_path):
+        with track(state_file(tmp_path), run_id="r1"):
             ask("hi")
 
-    state = load_run(tmp_path / "r1.json")
+    state = read_state(tmp_path, "r1")
     assert state["status"] == "failed"
     assert state["calls"][0]["status"] == "failed"
     assert "provider down" in state["calls"][0]["error"]
 
 
-def test_untracked_calls_write_nothing(monkeypatch, tmp_path):
+def test_run_failed_event_carries_error(monkeypatch):
+    _content_fake(monkeypatch, lambda t: t)
+    events = []
+
+    with pytest.raises(ValueError):
+        with track(events.append):
+            raise ValueError("user code broke")
+
+    assert events[-1]["event"] == "run_failed"
+    assert "user code broke" in events[-1]["error"]
+
+
+def test_untracked_calls_emit_nothing(monkeypatch, tmp_path):
     _content_fake(monkeypatch, lambda t: t)
 
     @llm(model="m")
@@ -87,26 +109,85 @@ def test_untracked_calls_write_nothing(monkeypatch, tmp_path):
         return q
 
     assert ask("hi") == "hi"
-    assert list_runs(tmp_path) == []
+    assert list(Path(tmp_path).glob("*.json")) == []
 
 
-def test_track_webhook_events(monkeypatch, tmp_path):
-    events = []
-    import agentsoup.tracking as tr
+def test_default_sink_is_state_file(monkeypatch, tmp_path):
+    _content_fake(monkeypatch, lambda t: t)
+    monkeypatch.chdir(tmp_path)
 
-    monkeypatch.setattr(tr, "_post_webhook", lambda url, payload, wait=False: events.append(payload))
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(run_id="r1"):
+        ask("hi")
+    assert read_state(tmp_path / ".agentsoup/runs", "r1")["status"] == "done"
+
+
+def test_webhook_sink_posts_events(monkeypatch):
+    _content_fake(monkeypatch, lambda t: t)
+    sent = []
+
+    class FakeResponse:
+        def read(self):
+            return b""
+
+    def fake_urlopen(req, timeout=None):
+        sent.append((json.loads(req.data), dict(req.headers)))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    # make async posts synchronous for deterministic ordering
+    monkeypatch.setattr(
+        "agentsoup.tracking.threading.Thread",
+        lambda target, daemon: type("T", (), {"start": staticmethod(target)})(),
+    )
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(webhook("http://x/hook", headers={"Authorization": "Bearer t"}), run_id="r1"):
+        ask("hi")
+
+    assert [e["event"] for e, _ in sent] == ["run_started", "call_started", "call_finished", "run_finished"]
+    assert sent[2][0]["name"] == "ask"
+    assert any(k.lower() == "authorization" for _, h in sent for k in h)
+
+
+def test_webhook_failure_never_breaks_run(monkeypatch, tmp_path):
+    def explode(req, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr("urllib.request.urlopen", explode)
     _content_fake(monkeypatch, lambda t: t)
 
     @llm(model="m")
     def ask(q: str) -> str:
         return q
 
-    with track(run_id="r1", state_dir=tmp_path, webhook_url="http://x/hook"):
-        ask("hi")
+    with track(webhook("http://down.example"), run_id="r1"):
+        assert ask("hi") == "hi"
 
-    assert [e["event"] for e in events] == ["run_started", "call_started", "call_finished", "run_finished"]
-    assert events[2]["call"]["name"] == "ask"
-    assert events[-1]["run_status"] == "done"
+
+def test_raising_sink_is_disabled_others_continue(monkeypatch):
+    _content_fake(monkeypatch, lambda t: t)
+    good = []
+
+    def bad(event):
+        raise RuntimeError("sink bug")
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(bad, good.append, run_id="r1"):
+        assert ask("a") == "a"
+        assert ask("b") == "b"
+
+    assert [e["event"] for e in good] == [
+        "run_started", "call_started", "call_finished", "call_started", "call_finished", "run_finished"]
 
 
 def test_state_readable_from_elsewhere_mid_run(monkeypatch, tmp_path):
@@ -115,7 +196,7 @@ def test_state_readable_from_elsewhere_mid_run(monkeypatch, tmp_path):
     import litellm
 
     def completion(**kwargs):
-        observed["mid"] = load_run(tmp_path / "r1.json")
+        observed["mid"] = read_state(tmp_path, "r1")
         return text_response("ok")
 
     monkeypatch.setattr(litellm, "completion", completion)
@@ -124,38 +205,24 @@ def test_state_readable_from_elsewhere_mid_run(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(run_id="r1", state_dir=tmp_path):
+    with track(state_file(tmp_path), run_id="r1"):
         ask("hi")
 
     assert observed["mid"]["status"] == "running"
     assert observed["mid"]["calls"][0]["status"] == "running"
-    assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_list_runs_ordering(monkeypatch, tmp_path):
-    _content_fake(monkeypatch, lambda t: t)
-
-    @llm(model="m")
-    def ask(q: str) -> str:
-        return q
-
-    with track(run_id="a", state_dir=tmp_path):
-        ask("1")
-    with track(run_id="b", state_dir=tmp_path):
-        ask("2")
-    assert [r["run_id"] for r in list_runs(tmp_path)] == ["a", "b"]
+    assert not list(Path(tmp_path).glob("*.tmp"))  # atomic writes leave no partials
 
 
 def test_concurrent_tracks_in_threads_are_isolated(monkeypatch, tmp_path):
-    """C1: two threads with their own track() blocks must not cross-record."""
     _content_fake(monkeypatch, lambda t: t)
+    sink = state_file(tmp_path)  # one sink instance shared across runs is fine
 
     @llm(model="m")
     def ask(q: str) -> str:
         return q
 
     def worker(run_id, n):
-        with track(run_id=run_id, state_dir=tmp_path):
+        with track(sink, run_id=run_id):
             for i in range(n):
                 ask(f"{run_id}-{i}")
 
@@ -163,46 +230,41 @@ def test_concurrent_tracks_in_threads_are_isolated(monkeypatch, tmp_path):
     t2 = threading.Thread(target=worker, args=("rb", 3))
     t1.start(); t2.start(); t1.join(); t2.join()
 
-    ra, rb = load_run(tmp_path / "ra.json"), load_run(tmp_path / "rb.json")
+    ra, rb = read_state(tmp_path, "ra"), read_state(tmp_path, "rb")
     assert len(ra["calls"]) == 3 and len(rb["calls"]) == 3
     assert all(c["output"].startswith("ra-") for c in ra["calls"])
     assert all(c["output"].startswith("rb-") for c in rb["calls"])
 
 
 def test_nested_track_restores_outer(monkeypatch, tmp_path):
-    """C1: closing an inner track() must restore the outer run, not clear it."""
     _content_fake(monkeypatch, lambda t: t)
 
     @llm(model="m")
     def ask(q: str) -> str:
         return q
 
-    with track(run_id="outer", state_dir=tmp_path):
-        with track(run_id="inner", state_dir=tmp_path):
+    with track(state_file(tmp_path), run_id="outer"):
+        with track(state_file(tmp_path), run_id="inner"):
             ask("in")
         ask("out")  # must land in the outer run
 
-    outer = load_run(tmp_path / "outer.json")
-    inner = load_run(tmp_path / "inner.json")
-    assert [c["output"] for c in inner["calls"]] == ["in"]
-    assert [c["output"] for c in outer["calls"]] == ["out"]
+    assert [c["output"] for c in read_state(tmp_path, "inner")["calls"]] == ["in"]
+    assert [c["output"] for c in read_state(tmp_path, "outer")["calls"]] == ["out"]
 
 
 def test_map_calls_land_in_the_callers_run(monkeypatch, tmp_path):
-    """C1: the caller's run must propagate into .map worker threads."""
     _content_fake(monkeypatch, lambda t: t.upper())
 
     @llm(model="m")
     def shout(w: str) -> str:
         return w
 
-    with track(run_id="r1", state_dir=tmp_path):
+    with track(state_file(tmp_path), run_id="r1"):
         shout.map(["a", "b"])
-    assert len(load_run(tmp_path / "r1.json")["calls"]) == 2
+    assert len(read_state(tmp_path, "r1")["calls"]) == 2
 
 
 def test_unwritable_state_dir_never_breaks_the_run(monkeypatch, tmp_path):
-    """C2/C3: tracking I/O failures disable tracking, nothing else."""
     _content_fake(monkeypatch, lambda t: t)
 
     @llm(model="m")
@@ -212,9 +274,9 @@ def test_unwritable_state_dir_never_breaks_the_run(monkeypatch, tmp_path):
     blocker = tmp_path / "file"
     blocker.write_text("not a dir")  # state_dir parent is a file -> mkdir fails
 
-    with track(run_id="r1", state_dir=blocker / "runs"):
-        assert ask("hi") == "hi"          # run proceeds
-    assert ask("after") == "after"        # and later untracked calls are unaffected
+    with track(state_file(blocker / "runs"), run_id="r1"):
+        assert ask("hi") == "hi"          # sink disabled with a warning, run proceeds
+    assert ask("after") == "after"        # later untracked calls unaffected
 
 
 def test_usage_recorded_per_call_and_totalled(monkeypatch, tmp_path):
@@ -232,22 +294,51 @@ def test_usage_recorded_per_call_and_totalled(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(run_id="r1", state_dir=tmp_path):
+    with track(state_file(tmp_path), run_id="r1"):
         ask("a")
         ask("b")
 
-    state = load_run(tmp_path / "r1.json")
+    state = read_state(tmp_path, "r1")
     assert state["calls"][0]["usage"] == {
         "llm_calls": 1, "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0}
     assert state["usage"] == {
         "llm_calls": 2, "prompt_tokens": 20, "completion_tokens": 10, "cost_usd": 0.0}
 
 
-def test_untracked_calls_skip_usage_accounting(monkeypatch, tmp_path):
+def test_otel_sink_spans(monkeypatch):
+    from agentsoup import otel
+
     _content_fake(monkeypatch, lambda t: t)
+    spans = []
+
+    class FakeSpan:
+        def __init__(self, name, attributes):
+            self.name, self.attrs, self.ended = name, dict(attributes), False
+
+        def set_attribute(self, k, v):
+            self.attrs[k] = v
+
+        def set_status(self, *a, **k):
+            pass
+
+        def end(self):
+            self.ended = True
+
+    class FakeTracer:
+        def start_span(self, name, attributes=None):
+            span = FakeSpan(name, attributes or {})
+            spans.append(span)
+            return span
 
     @llm(model="m")
     def ask(q: str) -> str:
         return q
 
-    assert ask("hi") == "hi"  # no run active: stats path disabled, no error
+    with track(otel(tracer=FakeTracer()), run_id="r1"):
+        ask("hi")
+
+    [span] = spans
+    assert span.name == "ask" and span.ended
+    assert span.attrs["agentsoup.run_id"] == "r1"
+    assert span.attrs["agentsoup.llm_calls"] == 1
+    assert "agentsoup.duration_s" in span.attrs

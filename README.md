@@ -182,20 +182,31 @@ def reliable_write(topic, rules, budget=3):
 
 Deterministic checks are an `if`; a judge panel is `judge.map(...)`; best-of-N is `write.map([topic] * 5)` plus picking the winner; escalation is `write.with_options(model=...)` on the last attempt.
 
-## Tracking: watch any run from anywhere
+## Tracking: a sink is just a function
 
-Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — is recorded:
+Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — emits a plain JSON-serializable event dict to your sinks. A sink is any callable taking one dict:
 
 ```python
-from agentsoup import track, load_run, list_runs
+from agentsoup import track, state_file, webhook, otel
 
-with track(webhook_url="https://example.com/hook") as run:
+with track() as run_id:                        # default sink: state_file(".agentsoup/runs")
     write_article("octopus intelligence")
 
-print(run.state_path)      # .agentsoup/runs/<run_id>.json
+with track(state_file("runs/"),                # combine any sinks
+           webhook("https://example.com/hook", headers={"Authorization": "Bearer ..."}),
+           otel()):                            # pip install agentsoup[otel]
+    write_article(topic)
+
+with track(print): ...                         # instant debugger
+events = []
+with track(events.append): ...                 # capture for tests/analysis
 ```
 
-The state file is updated atomically after every call (name, status, timings, output, error, and usage — LLM calls, prompt/completion tokens, estimated USD cost, totalled per run), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. The active run is context-local, so concurrent runs in different threads stay isolated (and it follows into `.map` workers); tracking I/O failures disable tracking with a logged warning — they never break the run itself.
+Events: `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` (or `run_failed`), each carrying `run_id`, `time`, and for calls: `call_id`, `name`, `duration_s`, `output` or `error`, and `usage` (LLM calls, prompt/completion tokens, estimated USD cost).
+
+The shipped sinks: `state_file(dir)` maintains `<dir>/<run_id>.json` — a full snapshot rewritten atomically after every event (with run-level usage totals), so another process can watch live with `json.loads(path.read_text())`; `webhook(url, headers=)` POSTs each event (terminal events block so process exit can't drop them); `otel()` opens one OpenTelemetry span per call with usage/cost attributes, feeding whatever tracer provider you've configured.
+
+The library owns the correctness so your sinks can be naive: sink calls are serialized under a lock (safe under `.map` fan-out), the active tracker is context-local (concurrent runs in different threads stay isolated; nested blocks restore the outer), and a sink that raises is disabled with a logged warning — tracking can never fail the run.
 
 ## API summary
 
@@ -205,7 +216,8 @@ The state file is updated atomically after every call (name, status, timings, ou
 | `@agent` | alias of `@llm` — reads better when tools are involved |
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
-| `track()`, `load_run`, `list_runs` | record every call in a block to a state file + webhook |
+| `track(*sinks, run_id=)` | emit every call in a block as event dicts; a sink is any callable |
+| `state_file(dir)` / `webhook(url, headers=)` / `otel()` | shipped sinks: live JSON snapshot, HTTP push, OpenTelemetry spans |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
 | `CompleteResponse[T]` | also get the raw completion + full transcript (`.messages`) for full-context continuation |
 | `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |

@@ -278,20 +278,20 @@ def llm(
             raise AgentMaxTurnsError(max_turns, messages)
 
         def _tracked(args, kwargs, labeled_mcp):
-            from .tracking import current_run
+            from .tracking import current_tracker
 
-            run = current_run()
-            if run is None:
+            tracker = current_tracker()
+            if tracker is None:
                 return _invoke(args, kwargs, labeled_mcp)
-            call = run._start(f.__name__)
+            call_id = tracker.call_started(f.__name__)
             started = time.monotonic()
             stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
             try:
                 result = _invoke(args, kwargs, labeled_mcp, stats)
             except Exception as e:
-                run._fail(call, started, e, stats)
+                tracker.call_failed(call_id, f.__name__, round(time.monotonic() - started, 3), e, stats)
                 raise
-            run._finish(call, started, result, stats)
+            tracker.call_finished(call_id, f.__name__, round(time.monotonic() - started, 3), result, stats)
             return result
 
         @functools.wraps(f)

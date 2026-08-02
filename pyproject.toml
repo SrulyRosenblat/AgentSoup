@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+otel = ["opentelemetry-api>=1.20"]
 
 [project.urls]
 Homepage = "https://github.com/SrulyRosenblat/AgentSoup"
