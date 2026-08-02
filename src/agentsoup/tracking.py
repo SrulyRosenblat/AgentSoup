@@ -67,7 +67,9 @@ class Run:
         self.webhook_url = webhook_url
         self.state = {
             "run_id": self.run_id, "status": "running",
-            "created_at": _now(), "updated_at": _now(), "calls": [],
+            "created_at": _now(), "updated_at": _now(),
+            "usage": {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
+            "calls": [],
         }
         self._token = None
         self._broken = False
@@ -93,10 +95,17 @@ class Run:
                 "call": call, "run_status": self.state["status"],
             }, wait=event in ("run_finished", "run_failed"))
 
+    def _add_usage(self, stats):
+        if stats:
+            totals = self.state["usage"]
+            for key, value in stats.items():
+                totals[key] = round(totals.get(key, 0) + value, 6)
+
     def _start(self, name: str) -> dict:
         call = {
             "name": name, "status": "running", "started_at": _now(),
-            "finished_at": None, "duration_s": None, "output": None, "error": None,
+            "finished_at": None, "duration_s": None, "output": None,
+            "error": None, "usage": None,
         }
         with _lock:
             call["index"] = len(self.state["calls"])
@@ -105,18 +114,21 @@ class Run:
         self._emit("call_started", call)
         return call
 
-    def _finish(self, call: dict, started: float, output):
+    def _finish(self, call: dict, started: float, output, stats=None):
         with _lock:
             call.update(status="done", finished_at=_now(),
-                        duration_s=round(time.monotonic() - started, 3), output=_jsonable(output))
+                        duration_s=round(time.monotonic() - started, 3),
+                        output=_jsonable(output), usage=stats)
+            self._add_usage(stats)
         self._save()
         self._emit("call_finished", call)
 
-    def _fail(self, call: dict, started: float, error: BaseException):
+    def _fail(self, call: dict, started: float, error: BaseException, stats=None):
         with _lock:
             call.update(status="failed", finished_at=_now(),
                         duration_s=round(time.monotonic() - started, 3),
-                        error=f"{type(error).__name__}: {error}")
+                        error=f"{type(error).__name__}: {error}", usage=stats)
+            self._add_usage(stats)
         self._save()
         self._emit("call_failed", call)
 

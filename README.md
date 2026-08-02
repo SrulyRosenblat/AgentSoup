@@ -195,7 +195,7 @@ with track(webhook_url="https://example.com/hook") as run:
 print(run.state_path)      # .agentsoup/runs/<run_id>.json
 ```
 
-The state file is updated atomically after every call (name, status, timings, output, error), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. The active run is context-local, so concurrent runs in different threads stay isolated (and it follows into `.map` workers); tracking I/O failures disable tracking with a logged warning — they never break the run itself.
+The state file is updated atomically after every call (name, status, timings, output, error, and usage — LLM calls, prompt/completion tokens, estimated USD cost, totalled per run), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. The active run is context-local, so concurrent runs in different threads stay isolated (and it follows into `.map` workers); tracking I/O failures disable tracking with a logged warning — they never break the run itself.
 
 ## API summary
 

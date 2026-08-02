@@ -4,6 +4,7 @@ import functools
 import inspect
 import json
 import random
+import re
 import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -82,10 +83,14 @@ class Tool:
     @classmethod
     def from_function(cls, fn: Callable) -> "Tool":
         target = inspect.unwrap(fn)  # see through @llm/@agent wrappers
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", target.__name__):
+            raise ValueError(f"Invalid tool name {target.__name__!r} (use a named function)")
         hints = get_type_hints(target)
         hints.pop("return", None)
         fields = {}
         for name, p in inspect.signature(target).parameters.items():
+            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise ValueError(f"Tool {target.__name__!r} cannot use *args/**kwargs")
             default = ... if p.default is inspect.Parameter.empty else p.default
             fields[name] = (hints.get(name, str), default)
         arg_model = pydantic.create_model(f"{target.__name__}_args", **fields)
@@ -230,7 +235,20 @@ def llm(
                 return _open_mcp(mcp_servers)
             return nullcontext([])
 
-        def _invoke(args, kwargs, labeled_mcp):
+        def _record_usage(stats, response):
+            if stats is None:
+                return
+            stats["llm_calls"] += 1
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                stats["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+                stats["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+            try:
+                stats["cost_usd"] += litellm.completion_cost(response)
+            except Exception:
+                pass  # unknown model/fake response — tokens still recorded
+
+        def _invoke(args, kwargs, labeled_mcp, stats=None):
             all_tools = _merge_tools(static_tools, labeled_mcp)
             tool_map = {t.name: t for t in all_tools}
             call_kwargs = dict(extra)
@@ -242,6 +260,7 @@ def llm(
             messages = [m.to_openai_format() for m in prompt_messages]
             for _ in range(max_turns):
                 response = _retry_completion(retries, model=model, messages=messages, **call_kwargs)
+                _record_usage(stats, response)
                 msg = response.choices[0].message
                 tool_calls = getattr(msg, "tool_calls", None)
                 if not tool_calls:
@@ -266,12 +285,13 @@ def llm(
                 return _invoke(args, kwargs, labeled_mcp)
             call = run._start(f.__name__)
             started = time.monotonic()
+            stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
             try:
-                result = _invoke(args, kwargs, labeled_mcp)
+                result = _invoke(args, kwargs, labeled_mcp, stats)
             except Exception as e:
-                run._fail(call, started, e)
+                run._fail(call, started, e, stats)
                 raise
-            run._finish(call, started, result)
+            run._finish(call, started, result, stats)
             return result
 
         @functools.wraps(f)

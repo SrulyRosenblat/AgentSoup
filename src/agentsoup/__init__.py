@@ -16,7 +16,12 @@ from .parts import (
 )
 from .tracking import Run, list_runs, load_run, track
 
-__version__ = "0.2.0"
+try:  # single-sourced from pyproject.toml
+    from importlib.metadata import version as _version
+
+    __version__ = _version("agentsoup")
+except Exception:  # uninstalled checkout
+    __version__ = "0.0.0"
 
 __all__ = [
     "llm", "agent", "Tool", "CompleteResponse", "AgentMaxTurnsError",

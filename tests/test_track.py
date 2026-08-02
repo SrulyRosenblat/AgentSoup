@@ -215,3 +215,39 @@ def test_unwritable_state_dir_never_breaks_the_run(monkeypatch, tmp_path):
     with track(run_id="r1", state_dir=blocker / "runs"):
         assert ask("hi") == "hi"          # run proceeds
     assert ask("after") == "after"        # and later untracked calls are unaffected
+
+
+def test_usage_recorded_per_call_and_totalled(monkeypatch, tmp_path):
+    import litellm
+    from types import SimpleNamespace
+
+    def completion(**kwargs):
+        r = text_response("ok")
+        r.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        return r
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(run_id="r1", state_dir=tmp_path):
+        ask("a")
+        ask("b")
+
+    state = load_run(tmp_path / "r1.json")
+    assert state["calls"][0]["usage"] == {
+        "llm_calls": 1, "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0}
+    assert state["usage"] == {
+        "llm_calls": 2, "prompt_tokens": 20, "completion_tokens": 10, "cost_usd": 0.0}
+
+
+def test_untracked_calls_skip_usage_accounting(monkeypatch, tmp_path):
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    assert ask("hi") == "hi"  # no run active: stats path disabled, no error

@@ -676,3 +676,15 @@ def test_transcript_persists_through_json(fake_completion):
     restored = [Message.from_openai_format(d) for d in json_mod.loads(blob)]   # load
     assert [m.role for m in restored] == [m.role for m in resp.messages]
     assert restored[1].extra["tool_calls"][0]["id"] == "c1"
+
+
+def test_invalid_tool_rejected_at_decoration():
+    with pytest.raises(ValueError, match="Invalid tool name"):
+        Tool.from_function(lambda x: x)
+
+    def varargs_tool(*args) -> str:
+        """Bad."""
+        return "x"
+
+    with pytest.raises(ValueError, match="args"):
+        Tool.from_function(varargs_tool)
