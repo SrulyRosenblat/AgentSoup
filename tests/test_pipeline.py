@@ -295,3 +295,31 @@ def bare(x):
     assert steps[0]["description"] == "Doubles the input"
     assert steps[1]["description"] == "Wrap in a dict."  # docstring fallback
     assert steps[2]["description"] is None
+
+
+def test_agent_step_in_pipeline(tmp_path, fake_completion):
+    from tests.conftest import text_response, tool_call_response
+
+    src = """
+from agentsoup import step, agent
+
+def shout(text: str) -> str:
+    '''Uppercase some text.'''
+    return text.upper()
+
+@step
+@agent(model="m", tools=[shout])
+def respond(q):
+    return q
+
+@step
+def wrap(x, respond):
+    return {"answer": respond}
+"""
+    fake_completion.queue.append(tool_call_response([("c1", "shout", {"text": "hi"})]))
+    fake_completion.queue.append(text_response("HI!"))
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    result = pipeline.run(input="hi", state_dir=tmp_path / "runs")
+    assert result.output == {"answer": "HI!"}
+    steps = load_run(result.state_path)["steps"]
+    assert steps[0]["name"] == "respond" and steps[0]["status"] == "done"
