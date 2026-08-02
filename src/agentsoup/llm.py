@@ -14,7 +14,7 @@ from typing import Any, Callable, Generic, NamedTuple, TypeVar, get_args, get_or
 import litellm
 import pydantic
 
-from .parts import coerce
+from .parts import Message, Text, coerce
 
 T = TypeVar("T")
 
@@ -171,6 +171,7 @@ def _merge_tools(static_tools, labeled_mcp):
 
 def llm(
     model: str = "gpt-4.1",
+    system: str | Message | None = None,
     tools: tuple = (),
     max_turns: int = 10,
     retries: int = 3,
@@ -185,6 +186,9 @@ def llm(
     call it once per item, in parallel, returning the list of results in order.
     MCP sessions are opened once per outer call (shared across a whole .map).
 
+    ``system=`` sets a default system prompt, prepended to every call — unless the
+    function's return value includes its own system() message, which overrides it.
+
     Transient provider errors (rate limits, timeouts, connection/5xx) are retried
     ``retries`` times with exponential backoff + jitter (0.5s doubling, 8s cap)."""
     if callable(model):  # bare @llm / @agent without parentheses
@@ -192,6 +196,11 @@ def llm(
 
     def deco(f):
         return_type, wants_complete = _split_return_type(f)
+        default_system = (
+            None if system is None
+            else system if isinstance(system, Message)
+            else Message("system", [Text(system)])
+        )
         static_tools, mcp_servers = _split_tools(tools)
         names = [t.name for t in static_tools]
         if len(set(names)) != len(names):
@@ -222,7 +231,10 @@ def llm(
             call_kwargs = dict(extra)
             if all_tools:
                 call_kwargs["tools"] = [t.to_openai_schema() for t in all_tools]
-            messages = [m.to_openai_format() for m in coerce(f(*args, **kwargs))]
+            prompt_messages = coerce(f(*args, **kwargs))
+            if default_system is not None and not any(m.role == "system" for m in prompt_messages):
+                prompt_messages = [default_system, *prompt_messages]
+            messages = [m.to_openai_format() for m in prompt_messages]
             for _ in range(max_turns):
                 response = _retry_completion(retries, model=model, messages=messages, **call_kwargs)
                 msg = response.choices[0].message
@@ -286,7 +298,7 @@ def llm(
 
         wrapper.map = map_
         wrapper.with_options = lambda **overrides: llm(
-            **{"model": model, "tools": tools, "max_turns": max_turns,
+            **{"model": model, "system": system, "tools": tools, "max_turns": max_turns,
                "retries": retries, **llm_kwargs, **overrides}
         )(f)
         return wrapper

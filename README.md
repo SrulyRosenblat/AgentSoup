@@ -31,6 +31,14 @@ The function body builds the prompt; the return **type hint** picks the output: 
 
 Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=3` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables.
 
+Set a default system prompt on the decorator with `system=` — it's prepended to every call, and overridden whenever the return value includes its own `system(...)` message (or via `with_options(system=...)`):
+
+```python
+@llm(model="gpt-4.1", system="You are a terse librarian.")
+def recommend(topic: str) -> Book:
+    return f"Recommend one great book about {topic}"
+```
+
 Any decorated function can be re-tuned without re-defining it — `with_options` returns a copy with merged parameters (any litellm kwarg; on agents also `tools`, `mcp_servers`, `max_turns`):
 
 ```python
@@ -126,6 +134,26 @@ def write_article(topic):                       # the whole pipeline
     return edit(sections)                       # fan in
 ```
 
+## Chat is a list
+
+No session or context objects — history is a plain list of messages you own. Splat it into the returned tuple; the trailing loose value becomes the new user message:
+
+```python
+from agentsoup import llm, user, assistant
+
+@llm(model="gpt-4.1", system="You are a helpful assistant.")
+def reply(history, msg: str) -> str:
+    return *history, msg
+
+history = []
+while (msg := input("> ")):
+    answer = reply(history, msg)
+    print(answer)
+    history += [user(msg), assistant(answer)]
+```
+
+Windowing is `history[-20:]`; branching a conversation is copying the list (`reply.map` over variants works too); persistence is `json.dumps([m.to_openai_format() for m in history])`. Structured outputs mid-conversation just work — `assistant(some_pydantic_obj)` serializes it as JSON.
+
 ## Validation is just a loop
 
 There is no requirements/verifier framework either — a judge is just another `@llm` function, and validate-and-repair is a `for` loop:
@@ -171,7 +199,7 @@ The state file is updated atomically after every call (name, status, timings, ou
 
 | | |
 |---|---|
-| `@llm(model, tools=, max_turns=, retries=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
+| `@llm(model, system=, tools=, max_turns=, retries=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
 | `@agent` | alias of `@llm` — reads better when tools are involved |
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |

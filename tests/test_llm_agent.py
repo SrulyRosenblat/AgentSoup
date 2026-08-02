@@ -557,3 +557,54 @@ def test_retries_zero_disables(monkeypatch):
     with pytest.raises(litellm.RateLimitError):
         ask("hi")
     assert len(attempts) == 1
+
+
+def test_decorator_system_prompt_prepended(fake_completion):
+    fake_completion.queue.append(text_response("ok"))
+
+    @llm(model="m", system="Be terse.")
+    def ask(q: str) -> str:
+        return q
+
+    assert ask("hi") == "ok"
+    messages = fake_completion.calls[0]["messages"]
+    assert messages[0] == {"role": "system", "content": [{"type": "text", "text": "Be terse."}]}
+    assert messages[1]["role"] == "user"
+
+
+def test_returned_system_message_overrides_decorator_default(fake_completion):
+    from agentsoup import system
+
+    fake_completion.queue.append(text_response("ok"))
+
+    @llm(model="m", system="Be terse.")
+    def ask(q: str) -> str:
+        return system("Be verbose."), q
+
+    ask("hi")
+    messages = fake_completion.calls[0]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert messages[0]["content"][0]["text"] == "Be verbose."
+
+
+def test_with_options_overrides_system(fake_completion):
+    fake_completion.queue.append(text_response("ok"))
+
+    @llm(model="m", system="Be terse.")
+    def ask(q: str) -> str:
+        return q
+
+    pirate = ask.with_options(system="Talk like a pirate.")
+    pirate("hi")
+    assert fake_completion.calls[0]["messages"][0]["content"][0]["text"] == "Talk like a pirate."
+
+
+def test_no_system_by_default(fake_completion):
+    fake_completion.queue.append(text_response("ok"))
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    ask("hi")
+    assert fake_completion.calls[0]["messages"][0]["role"] == "user"
