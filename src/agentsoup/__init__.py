@@ -14,7 +14,7 @@ from .parts import (
     system,
     user,
 )
-from .pipeline import Pipeline, PipelineResult, list_runs, load_run, step
+from .tracking import list_runs, load_run, track
 
 __version__ = "0.2.0"
 
@@ -23,5 +23,5 @@ __all__ = [
     "StdioServer", "HTTPServer",
     "MessagePart", "Text", "Image", "Video", "Audio", "File",
     "Message", "system", "user", "assistant", "coerce",
-    "step", "Pipeline", "PipelineResult", "load_run", "list_runs",
+    "track", "load_run", "list_runs",
 ]

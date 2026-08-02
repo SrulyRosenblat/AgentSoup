@@ -19,9 +19,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
-[project.scripts]
-agentsoup = "agentsoup.cli:main"
-
 [project.urls]
 Homepage = "https://github.com/SrulyRosenblat/AgentSoup"
 

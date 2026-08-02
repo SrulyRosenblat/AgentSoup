@@ -3,6 +3,7 @@ import functools
 import inspect
 import json
 import shlex
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -147,6 +148,22 @@ def llm(
 
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
+            from .tracking import current_run
+
+            run = current_run()
+            if run is not None:
+                call = run._start(f.__name__)
+                started = time.monotonic()
+                try:
+                    result = _call(*args, **kwargs)
+                except Exception as e:
+                    run._fail(call, started, e)
+                    raise
+                run._finish(call, started, result)
+                return result
+            return _call(*args, **kwargs)
+
+        def _call(*args, **kwargs):
             if mcp_servers:
                 from .mcp import _open_mcp
 

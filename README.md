@@ -113,75 +113,31 @@ def helper(task: str) -> str:
 
 The model sees MCP tools and Python tools identically. Sessions connect when the function is called and tear down when it returns.
 
-## Pipelines: a file of steps, tracked from anywhere
+## Pipelines and subagents are just functions
 
-Mark functions in a file with `@step`; they run in order, each step's output feeding the next. Steps can be plain functions, `@llm`, or `@agent` (put `@step` on top):
-
-```python
-# steps.py
-from agentsoup import step, llm
-
-@step
-@llm(model="gpt-4.1")
-def outline(topic: str) -> str:
-    return f"Write an outline about {topic}"
-
-@step
-@llm(model="gpt-4.1")
-def draft(outline: str) -> str:
-    return "Write a full draft from this outline:", outline
-```
-
-Steps can also pull **any earlier step's output by name** — name a parameter after a step and it receives that step's result; one leftover required parameter still gets the previous step's output:
+There is no pipeline framework. A pipeline is a function that calls other functions; a subagent is an `@llm` function called by another (directly in the body, or handed to the model via `tools=`); parallelism is `.map()`:
 
 ```python
-@step
-def publish(draft, outline):        # gets draft's AND outline's outputs
-    return {"outline": outline, "article": draft}
+def write_article(topic):                       # the whole pipeline
+    o = outline(topic)
+    sections = draft_section.map(plan(o))       # fan out
+    return edit(sections)                       # fan in
 ```
 
-**Named parameters are also the dependency graph.** Steps whose parameters all name earlier steps run as soon as those steps finish — so independent branches run **in parallel**, no extra syntax:
+## Tracking: watch any run from anywhere
+
+Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — is recorded:
 
 ```python
-@step
-def outline(topic): ...
+from agentsoup import track, load_run, list_runs
 
-@step
-def facts(outline): ...        # these two only depend on outline,
-@step
-def quotes(outline): ...       # so they run concurrently
+with track(webhook_url="https://example.com/hook") as run:
+    write_article("octopus intelligence")
 
-@step
-def article(facts, quotes):    # waits for both branches
-    ...
+print(run.state_path)      # .agentsoup/runs/<run_id>.json
 ```
 
-**Fanning out inside a step** is just `.map()` — a step body is ordinary Python:
-
-```python
-@step
-def research_all(subtopics):
-    return research.map(subtopics)     # one agent per subtopic, in parallel
-```
-
-(`@step(name="...")` renames a step; `@step(order=n)` overrides definition order; `@step(description="...")` — or the docstring — is recorded in the run state; `run(max_workers=n)` caps step concurrency.)
-
-Run it from Python or the CLI:
-
-```bash
-agentsoup run steps.py --input "octopus intelligence" --webhook https://example.com/hook
-agentsoup status                 # list runs:  steps-20260802-101502-a3f9c1  done  2/2 steps ...
-agentsoup status <run_id>        # per-step detail (--json for raw state)
-```
-
-```python
-from agentsoup import Pipeline, load_run, list_runs
-
-result = Pipeline.from_file("steps.py").run(input="octopus intelligence")
-state = load_run(result.state_path)          # from any process, any time
-```
-
-Every run writes a JSON state file to `.agentsoup/runs/<run_id>.json` — updated atomically after each step with status, timings, outputs, and errors — so completion is trackable from another process. Pass `webhook_url=` (or `--webhook`) to also POST `run_started` / `step_finished` / `run_failed` … events as the run progresses.
+The state file is updated atomically after every call (name, status, timings, output, error), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. Tracking failures never break the run.
 
 ## API summary
 
@@ -191,7 +147,7 @@ Every run writes a JSON state file to `.agentsoup/runs/<run_id>.json` — update
 | `@agent` | alias of `@llm` — reads better when tools are involved |
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
-| `@step`, `Pipeline.from_file`, `load_run`, `list_runs` | pipelines + tracking |
+| `track()`, `load_run`, `list_runs` | record every call in a block to a state file + webhook |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
 | `CompleteResponse[T]` | also get the raw completion |
 | `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |
