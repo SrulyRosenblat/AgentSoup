@@ -55,9 +55,9 @@ def summarize_pdf(url: str) -> str:
 
 Explicit part/message types (`Text`, `Image`, `Video`, `Audio`, `File`, `system(...)`, `user(...)`, `assistant(...)`) are there when you want control — each media class takes a local path or URL.
 
-## Agents: same style, plus tools
+## Agents: the same decorator, plus tools
 
-A tool is any typed Python function with a docstring. Pass it to `@agent` and the model can call it in a loop until it has an answer:
+There is exactly one decorator — `@agent` is an alias of `@llm`. Add `tools=` and the model can call them in a loop until it has an answer. A tool is any typed Python function with a docstring:
 
 ```python
 from agentsoup import agent
@@ -80,20 +80,22 @@ Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, 
 
 ## MCP servers
 
-Declare MCP servers the same way as tools — their tools and your Python tools look identical to the model:
+MCP servers go in the **same `tools=` list** — as a URL string, a command string, or a config object when you need headers/env:
 
 ```python
-from agentsoup import agent, StdioServer, HTTPServer
+from agentsoup import agent, HTTPServer
 
-fs = StdioServer("npx", ["-y", "@modelcontextprotocol/server-filesystem", "./docs"])
-linear = HTTPServer("https://mcp.linear.app/mcp", headers={"Authorization": "Bearer ..."})
-
-@agent(model="gpt-4.1", tools=[get_weather], mcp_servers=[fs, linear])
+@agent(model="gpt-4.1", tools=[
+    get_weather,                                              # python function
+    "npx -y @modelcontextprotocol/server-filesystem ./docs",  # stdio MCP server
+    "https://mcp.example.com/mcp",                            # HTTP MCP server
+    HTTPServer("https://mcp.linear.app/mcp", headers={"Authorization": "Bearer ..."}),
+])
 def helper(task: str) -> str:
     return "Complete this task using the available tools:", task
 ```
 
-Sessions connect when the function is called and tear down when it returns.
+The model sees MCP tools and Python tools identically. Sessions connect when the function is called and tear down when it returns.
 
 ## Pipelines: a file of steps, tracked from anywhere
 
@@ -145,10 +147,10 @@ Every run writes a JSON state file to `.agentsoup/runs/<run_id>.json` — update
 
 | | |
 |---|---|
-| `@llm(model, **litellm_kwargs)` | function's return value → prompt; return hint → output type |
-| `@agent(model, tools=, mcp_servers=, max_turns=)` | `@llm` plus a native tool-calling loop |
-| `Tool.from_function(fn)` / `Tool(...)` | how callables become tool schemas (automatic in `tools=`) |
-| `StdioServer` / `HTTPServer` | MCP server configs |
+| `@llm(model, tools=, max_turns=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
+| `@agent` | alias of `@llm` — reads better when tools are involved |
+| `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
+| `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
 | `@step`, `Pipeline.from_file`, `load_run`, `list_runs` | pipelines + tracking |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
 | `CompleteResponse[T]` | also get the raw completion |

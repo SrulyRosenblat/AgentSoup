@@ -2,6 +2,7 @@
 import functools
 import inspect
 import json
+import shlex
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, NamedTuple, TypeVar, get_args, get_origin, get_type_hints
@@ -39,27 +40,6 @@ def _finalize(response, return_type, wants_complete):
     content = response.choices[0].message.content
     parsed = content if return_type in (None, str) else return_type.model_validate_json(content)
     return CompleteResponse(parsed, response) if wants_complete else parsed
-
-
-def llm(model: str = "gpt-4.1", **llm_kwargs):
-    """Decorator: the wrapped function's return value becomes the prompt."""
-
-    def deco(f):
-        return_type, wants_complete = _split_return_type(f)
-        extra = dict(llm_kwargs)
-        if return_type not in (None, str):
-            extra["response_format"] = return_type
-
-        @functools.wraps(f)
-        def wrapper(*args, **kwargs):
-            messages = [m.to_openai_format() for m in coerce(f(*args, **kwargs))]
-            response = litellm.completion(model=model, messages=messages, **extra)
-            return _finalize(response, return_type, wants_complete)
-
-        wrapper.with_options = lambda **overrides: llm(**{"model": model, **llm_kwargs, **overrides})(f)
-        return wrapper
-
-    return deco
 
 
 @dataclass
@@ -106,19 +86,45 @@ def _serialize_result(out) -> str:
     return json.dumps(out, default=str)
 
 
-def agent(
+def _split_tools(tools):
+    """Sort a mixed tools list into (static Tool objects, MCP server configs).
+
+    Accepts callables (incl. @llm/@agent functions), Tool instances,
+    StdioServer/HTTPServer configs, and strings — a URL becomes an HTTPServer,
+    any other string is a stdio server command line."""
+    from .mcp import HTTPServer, StdioServer
+
+    static, servers = [], []
+    for t in tools:
+        if isinstance(t, (StdioServer, HTTPServer)):
+            servers.append(t)
+        elif isinstance(t, str):
+            if t.startswith(("http://", "https://")):
+                servers.append(HTTPServer(t))
+            else:
+                command, *args = shlex.split(t)
+                servers.append(StdioServer(command, args))
+        elif isinstance(t, Tool):
+            static.append(t)
+        else:
+            static.append(Tool.from_function(t))
+    return static, servers
+
+
+def llm(
     model: str = "gpt-4.1",
     tools: tuple = (),
-    mcp_servers: tuple = (),
     max_turns: int = 10,
     **llm_kwargs,
 ):
-    """Like @llm, but runs a tool-calling loop. Tools are plain Python functions,
-    @llm/@agent functions, Tool instances, or tools from the given MCP servers."""
+    """Decorator: the wrapped function's return value becomes the prompt; its
+    return type hint picks the output format. With tools= it runs a tool-calling
+    loop; tools may be Python functions, other @llm functions, Tool instances,
+    MCP server configs (StdioServer/HTTPServer), or strings (URL or command)."""
 
     def deco(f):
         return_type, wants_complete = _split_return_type(f)
-        static_tools = [t if isinstance(t, Tool) else Tool.from_function(t) for t in tools]
+        static_tools, mcp_servers = _split_tools(tools)
         extra = dict(llm_kwargs)
         if return_type not in (None, str):
             extra["response_format"] = return_type
@@ -136,7 +142,7 @@ def agent(
                 all_tools = static_tools + list(mcp_tools)
                 tool_map = {t.name: t for t in all_tools}
                 if len(tool_map) != len(all_tools):
-                    raise ValueError("Duplicate tool names among tools/mcp_servers")
+                    raise ValueError("Duplicate tool names in tools=")
                 call_kwargs = dict(extra)
                 if all_tools:
                     call_kwargs["tools"] = [t.to_openai_schema() for t in all_tools]
@@ -156,10 +162,12 @@ def agent(
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
                 raise AgentMaxTurnsError(max_turns, messages)
 
-        wrapper.with_options = lambda **overrides: agent(
-            **{"model": model, "tools": tools, "mcp_servers": mcp_servers,
-               "max_turns": max_turns, **llm_kwargs, **overrides}
+        wrapper.with_options = lambda **overrides: llm(
+            **{"model": model, "tools": tools, "max_turns": max_turns, **llm_kwargs, **overrides}
         )(f)
         return wrapper
 
     return deco
+
+
+agent = llm  # one decorator; the alias just reads better when tools are involved

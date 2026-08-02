@@ -230,3 +230,42 @@ def test_with_options_on_agent_keeps_tools(fake_completion):
     assert seen == [1]
     assert fake_completion.calls[0]["model"] == "fast-model"
     assert fake_completion.calls[0]["tools"][0]["function"]["name"] == "probe"
+
+
+def test_tools_accepts_server_configs_and_strings():
+    from agentsoup import HTTPServer, StdioServer
+    from agentsoup.llm import _split_tools
+
+    def plain() -> str:
+        """P."""
+        return "x"
+
+    static, servers = _split_tools([
+        plain,
+        "https://mcp.example.com/mcp",
+        "npx -y @modelcontextprotocol/server-filesystem ./docs",
+        StdioServer("uvx", ["some-server"]),
+    ])
+    assert [t.name for t in static] == ["plain"]
+    assert isinstance(servers[0], HTTPServer) and servers[0].url == "https://mcp.example.com/mcp"
+    assert isinstance(servers[1], StdioServer)
+    assert servers[1].command == "npx"
+    assert servers[1].args == ["-y", "@modelcontextprotocol/server-filesystem", "./docs"]
+    assert servers[2].command == "uvx"
+
+
+def test_llm_with_tools_runs_the_loop(fake_completion):
+    """@llm and @agent are the same decorator; tools= turns on the loop."""
+    def shout(text: str) -> str:
+        """Uppercase."""
+        return text.upper()
+
+    fake_completion.queue.append(tool_call_response([("c1", "shout", {"text": "hi"})]))
+    fake_completion.queue.append(text_response("HI"))
+
+    @llm(model="m", tools=[shout])
+    def ask(q: str) -> str:
+        return q
+
+    assert ask("go") == "HI"
+    assert agent is llm
