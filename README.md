@@ -140,23 +140,25 @@ def article(facts, quotes):    # waits for both branches
     ...
 ```
 
-**Fan out** over a list with `@step(fan_out=True)` — the step runs once per item, in parallel, and its output is the list of results. Perfect for fanning out agents:
+**Fan out by yielding.** A step that `yield`s produces a stream: each downstream step runs once per item, in parallel, and the results come back together as a plain list at the next step. Perfect for fanning out agents:
 
 ```python
 @step
-@llm(model="gpt-4.1")
-def subtopics(topic) -> list:
-    return f"List 5 subtopics of {topic} as a JSON array"
-
-@step(fan_out=True)
-@agent(model="gpt-4.1", tools=[search])
-def research(subtopics):               # called once per subtopic, concurrently
-    return "Research this subtopic:", subtopics
+def subtopics(topic):
+    for sub in plan(topic):
+        yield sub                      # each item fans out downstream
 
 @step
-def combine(research):                 # gets the list of all agent answers
+@agent(model="gpt-4.1", tools=[search])
+def research(subtopic):                # called once per yielded item, concurrently
+    return "Research this subtopic:", subtopic
+
+@step
+def combine(research):                 # fan-in: the list of all agent answers
     ...
 ```
+
+A step that returns a list does *not* fan out (the next step gets the whole list); `yield from items` is the one-line adapter when you want it to. A fanned step that itself yields keeps the stream going, flattened.
 
 (`@step(name="...")` renames a step; `@step(order=n)` overrides definition order; `@step(description="...")` — or the docstring — is recorded in the run state; `run(max_workers=n)` caps concurrency.)
 

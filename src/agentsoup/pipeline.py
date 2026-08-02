@@ -24,20 +24,19 @@ def step(
     name: str | None = None,
     order: int | None = None,
     description: str | None = None,
-    fan_out: bool = False,
 ):
     """Mark a function as a pipeline step. Stacks on plain functions, @llm, or @agent
     (put @step outermost). Steps run in definition order unless order= is given.
     description= (or the docstring) is recorded in the run state file.
-    fan_out=True runs the step once per item of its input list, in parallel,
-    and its output becomes the list of results."""
+
+    A step that ``yield``s produces a stream: each downstream step consuming it
+    runs once per item, in parallel, and the results come back as a plain list."""
 
     def deco(f):
         f.__agentsoup_step__ = {
             "name": name or f.__name__,
             "order": order,
             "description": description or inspect.getdoc(f),
-            "fan_out": fan_out,
             "seq": next(_seq),
         }
         return f
@@ -78,6 +77,17 @@ def _store_output(step_state: dict, value):
         step_state["output_json"] = value
     except (TypeError, ValueError):
         step_state["output_repr"] = repr(value)[:10_000]
+
+
+class _Stream:
+    """Marks a step output produced by yielding: consumers fan out over it."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+
+def _unwrap_stream(value):
+    return value.items if isinstance(value, _Stream) else value
 
 
 def _params_of(fn) -> dict:
@@ -144,6 +154,8 @@ class Pipeline:
         names = [meta["name"] for meta, _ in self.steps]
         if len(set(names)) != len(names):
             raise ValueError(f"Duplicate step names: {sorted(n for n in names if names.count(n) > 1)}")
+        if inspect.isgenerator(input):
+            input = _Stream(input)
         run_id = run_id or new_run_id(self.source)
         state_path = Path(state_dir) / f"{run_id}.json"
         state = {
@@ -152,7 +164,7 @@ class Pipeline:
             "status": "running",
             "created_at": _now(),
             "updated_at": _now(),
-            "input_repr": None if input is None else repr(input)[:1_000],
+            "input_repr": None if input is None else repr(_unwrap_stream(input))[:1_000],
             "steps": [
                 {
                     "name": meta["name"], "description": meta.get("description"),
@@ -219,15 +231,29 @@ class Pipeline:
                     )
                 if unbound:
                     kwargs[unbound[0]] = input if i == 0 else outputs[names[i - 1]]
-                if meta.get("fan_out"):
-                    if not kwargs:
-                        raise ValueError(f"fan_out step '{meta['name']}' needs an input parameter")
-                    fan_param = unbound[0] if unbound else next(iter(params))
-                    items = list(kwargs[fan_param])
+                streams = [n for n, v in kwargs.items() if isinstance(v, _Stream)]
+                if len(streams) > 1:
+                    raise ValueError(
+                        f"Step '{meta['name']}' consumes multiple yielded streams {streams}; "
+                        "collect one into a list first"
+                    )
+                if streams:
+                    # Fan out: run once per yielded item, in parallel.
+                    fan_param = streams[0]
+                    items = kwargs[fan_param].items
                     with ThreadPoolExecutor(max_workers=max_workers) as fan_pool:
-                        value = list(fan_pool.map(lambda item: fn(**{**kwargs, fan_param: item}), items))
+                        results = list(fan_pool.map(
+                            lambda item: fn(**{**kwargs, fan_param: item}), items
+                        ))
+                    if results and all(inspect.isgenerator(r) for r in results):
+                        # a fanned step that itself yields keeps the stream going, flattened
+                        value = _Stream(x for r in results for x in r)
+                    else:
+                        value = results  # fan back in: plain list for the next step
                 else:
                     value = fn(**kwargs)
+                    if inspect.isgenerator(value):
+                        value = _Stream(value)
             except Exception as e:
                 step_state.update(
                     status="failed", finished_at=_now(),
@@ -240,7 +266,7 @@ class Pipeline:
             step_state.update(
                 status="done", finished_at=_now(), duration_s=round(time.monotonic() - started, 3)
             )
-            _store_output(step_state, value)
+            _store_output(step_state, _unwrap_stream(value))
             save()
             emit("step_finished", step_state)
             return value
@@ -272,7 +298,7 @@ class Pipeline:
         state["status"] = "done"
         save()
         emit("run_finished")
-        return PipelineResult(run_id, "done", outputs[names[-1]], str(state_path))
+        return PipelineResult(run_id, "done", _unwrap_stream(outputs[names[-1]]), str(state_path))
 
 
 def load_run(path) -> dict:

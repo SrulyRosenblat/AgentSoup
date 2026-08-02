@@ -373,27 +373,80 @@ def join(left, right):
     assert result.output == 13
 
 
-def test_fan_out_maps_over_items(tmp_path):
+def test_yielding_step_fans_out_consumer(tmp_path):
     src = """
 from agentsoup import step
 
 @step
 def items(x=None):
-    return [1, 2, 3]
-
-@step(fan_out=True)
-def double(items):
-    return items * 2       # receives ONE item at a time
+    yield 1
+    yield 2
+    yield 3
 
 @step
-def total(double):
+def double(item):          # unbound param -> one yielded item at a time
+    return item * 2
+
+@step
+def total(double):         # fan-in: gets the plain list of results
     return sum(double)
 """
     pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
     result = pipeline.run(state_dir=tmp_path / "runs")
     assert result.output == 12
     state = load_run(result.state_path)
+    assert state["steps"][0]["output_json"] == [1, 2, 3]
     assert state["steps"][1]["output_json"] == [2, 4, 6]  # order preserved
+
+
+def test_yield_from_adapts_a_list_output(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def listing(x=None):
+    return ["a", "b"]      # a plain list does NOT fan out...
+
+@step
+def each(listing):
+    yield from listing     # ...one-line adapter turns it into a stream
+
+@step
+def shout(item):
+    return item.upper()
+
+@step
+def join(shout):
+    return "-".join(shout)
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    assert pipeline.run(state_dir=tmp_path / "runs").output == "A-B"
+
+
+def test_fanned_generator_step_keeps_streaming(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def items(x=None):
+    yield 1
+    yield 2
+
+@step
+def expand(item):          # fanned AND yields -> flattened stream continues
+    yield item
+    yield item * 10
+
+@step
+def double(item):
+    return item * 2
+
+@step
+def total(double):
+    return sum(double)
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    assert pipeline.run(state_dir=tmp_path / "runs").output == 2 * (1 + 10 + 2 + 20)
 
 
 def test_fan_out_runs_items_concurrently(tmp_path):
@@ -403,12 +456,14 @@ import checker
 
 @step
 def items(x=None):
-    return ["a", "b", "c"]
+    yield "a"
+    yield "b"
+    yield "c"
 
-@step(fan_out=True)
-def work(items):
+@step
+def work(item):
     checker.sync()
-    return items.upper()
+    return item.upper()
 """
     import sys
     import types

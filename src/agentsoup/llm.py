@@ -36,9 +36,18 @@ def _split_return_type(f) -> tuple[type | None, bool]:
     return hint, False
 
 
+def _is_model(t) -> bool:
+    return isinstance(t, type) and issubclass(t, pydantic.BaseModel)
+
+
 def _finalize(response, return_type, wants_complete):
     content = response.choices[0].message.content
-    parsed = content if return_type in (None, str) else return_type.model_validate_json(content)
+    if return_type in (None, str):
+        parsed = content
+    elif _is_model(return_type):
+        parsed = return_type.model_validate_json(content)
+    else:  # list[str], dict, dataclass, ... — anything pydantic can adapt
+        parsed = pydantic.TypeAdapter(return_type).validate_json(content)
     return CompleteResponse(parsed, response) if wants_complete else parsed
 
 
@@ -126,7 +135,7 @@ def llm(
         return_type, wants_complete = _split_return_type(f)
         static_tools, mcp_servers = _split_tools(tools)
         extra = dict(llm_kwargs)
-        if return_type not in (None, str):
+        if _is_model(return_type):  # other hints (list[str], ...) are parse-only
             extra["response_format"] = return_type
 
         @functools.wraps(f)

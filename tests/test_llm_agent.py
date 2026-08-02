@@ -269,3 +269,14 @@ def test_llm_with_tools_runs_the_loop(fake_completion):
 
     assert ask("go") == "HI"
     assert agent is llm
+
+
+def test_non_model_return_hints_parse_via_typeadapter(fake_completion):
+    fake_completion.queue.append(text_response('["a", "b", "c"]'))
+
+    @llm(model="m")
+    def listy(q: str) -> list[str]:
+        return q
+
+    assert listy("go") == ["a", "b", "c"]
+    assert "response_format" not in fake_completion.calls[0]  # parse-only
