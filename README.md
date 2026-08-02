@@ -29,7 +29,7 @@ book = recommend("octopuses")   # Book(title='...', author='...')
 
 The function body builds the prompt; the return **type hint** picks the output: `-> str` (or none) returns text, a pydantic model returns a parsed instance, and `-> CompleteResponse[T]` returns `(parsed, raw_completion)`.
 
-Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=2` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables.
+Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=3` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables.
 
 Any decorated function can be re-tuned without re-defining it — `with_options` returns a copy with merged parameters (any litellm kwarg; on agents also `tools`, `mcp_servers`, `max_turns`):
 

@@ -173,7 +173,7 @@ def llm(
     model: str = "gpt-4.1",
     tools: tuple = (),
     max_turns: int = 10,
-    retries: int = 2,
+    retries: int = 3,
     **llm_kwargs,
 ):
     """Decorator: the wrapped function's return value becomes the prompt; its

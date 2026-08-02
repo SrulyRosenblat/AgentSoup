@@ -488,7 +488,7 @@ def test_retries_transient_errors_with_backoff(monkeypatch):
 
     monkeypatch.setattr(litellm, "completion", completion)
 
-    @llm(model="m")  # default retries=2 -> 3 attempts
+    @llm(model="m")  # default retries -> retried transparently
     def ask(q: str) -> str:
         return q
 
