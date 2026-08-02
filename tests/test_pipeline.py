@@ -134,21 +134,9 @@ def two(x):
 
 def test_webhook_events(tmp_path, monkeypatch):
     events = []
+    import agentsoup.pipeline as pl
 
-    class FakeResponse:
-        def read(self):
-            return b""
-
-    def fake_urlopen(req, timeout=None):
-        events.append(json.loads(req.data))
-        return FakeResponse()
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    # webhook posts happen on daemon threads; make them synchronous for the test
-    monkeypatch.setattr(
-        "agentsoup.pipeline.threading.Thread",
-        lambda target, daemon: type("T", (), {"start": staticmethod(target)})(),
-    )
+    monkeypatch.setattr(pl, "_post_webhook", lambda url, payload, wait=False: events.append(payload))
 
     pipeline = Pipeline.from_file(write_pipeline(tmp_path, BASIC))
     pipeline.run(input=1, state_dir=tmp_path / "runs", webhook_url="http://track.example/hook")
@@ -161,15 +149,35 @@ def test_webhook_events(tmp_path, monkeypatch):
     assert events[-1]["run_status"] == "done"
 
 
+def test_post_webhook_sends_json_and_swallows_errors(monkeypatch):
+    from agentsoup.pipeline import _post_webhook
+
+    sent = []
+
+    class FakeResponse:
+        def read(self):
+            return b""
+
+    def fake_urlopen(req, timeout=None):
+        sent.append(json.loads(req.data))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    _post_webhook("http://x.example/hook", {"event": "run_finished"}, wait=True)
+    assert sent == [{"event": "run_finished"}]
+
+    def explode(req, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr("urllib.request.urlopen", explode)
+    _post_webhook("http://x.example/hook", {"event": "run_finished"}, wait=True)  # no raise
+
+
 def test_webhook_failure_never_breaks_run(tmp_path, monkeypatch):
     def explode(req, timeout=None):
         raise OSError("network down")
 
     monkeypatch.setattr("urllib.request.urlopen", explode)
-    monkeypatch.setattr(
-        "agentsoup.pipeline.threading.Thread",
-        lambda target, daemon: type("T", (), {"start": staticmethod(target)})(),
-    )
     pipeline = Pipeline.from_file(write_pipeline(tmp_path, BASIC))
     result = pipeline.run(input=1, state_dir=tmp_path / "runs", webhook_url="http://down.example")
     assert result.status == "done"
@@ -323,3 +331,125 @@ def wrap(x, respond):
     assert result.output == {"answer": "HI!"}
     steps = load_run(result.state_path)["steps"]
     assert steps[0]["name"] == "respond" and steps[0]["status"] == "done"
+
+
+def test_independent_steps_run_in_parallel(tmp_path):
+    """Two steps that both name only `seed` meet at a barrier — impossible if
+    the runner were sequential."""
+    src = """
+from agentsoup import step
+import checker
+
+@step
+def seed(x=None):
+    return 1
+
+@step
+def left(seed):
+    checker.sync()
+    return seed + 1
+
+@step
+def right(seed):
+    checker.sync()
+    return seed + 10
+
+@step
+def join(left, right):
+    return left + right
+"""
+    import sys
+    import types
+
+    barrier = threading.Barrier(2, timeout=5)
+    checker = types.ModuleType("checker")
+    checker.sync = barrier.wait
+    sys.modules["checker"] = checker
+    try:
+        pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+        result = pipeline.run(state_dir=tmp_path / "runs")
+    finally:
+        del sys.modules["checker"]
+    assert result.output == 13
+
+
+def test_fan_out_maps_over_items(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def items(x=None):
+    return [1, 2, 3]
+
+@step(fan_out=True)
+def double(items):
+    return items * 2       # receives ONE item at a time
+
+@step
+def total(double):
+    return sum(double)
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    result = pipeline.run(state_dir=tmp_path / "runs")
+    assert result.output == 12
+    state = load_run(result.state_path)
+    assert state["steps"][1]["output_json"] == [2, 4, 6]  # order preserved
+
+
+def test_fan_out_runs_items_concurrently(tmp_path):
+    src = """
+from agentsoup import step
+import checker
+
+@step
+def items(x=None):
+    return ["a", "b", "c"]
+
+@step(fan_out=True)
+def work(items):
+    checker.sync()
+    return items.upper()
+"""
+    import sys
+    import types
+
+    barrier = threading.Barrier(3, timeout=5)
+    checker = types.ModuleType("checker")
+    checker.sync = barrier.wait
+    sys.modules["checker"] = checker
+    try:
+        pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+        result = pipeline.run(state_dir=tmp_path / "runs")
+    finally:
+        del sys.modules["checker"]
+    assert result.output == ["A", "B", "C"]
+
+
+def test_parallel_branch_failure_fails_run(tmp_path):
+    src = """
+from agentsoup import step
+
+@step
+def seed(x=None):
+    return 1
+
+@step
+def ok(seed):
+    return seed
+
+@step
+def bad(seed):
+    raise RuntimeError("branch died")
+
+@step
+def join(ok, bad):
+    return ok + bad
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    with pytest.raises(RuntimeError, match="branch died"):
+        pipeline.run(state_dir=tmp_path / "runs", run_id="r1")
+    state = load_run(tmp_path / "runs" / "r1.json")
+    assert state["status"] == "failed"
+    by_name = {s["name"]: s["status"] for s in state["steps"]}
+    assert by_name["bad"] == "failed"
+    assert by_name["join"] == "pending"  # never scheduled

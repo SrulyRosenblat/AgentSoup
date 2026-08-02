@@ -124,7 +124,41 @@ def publish(draft, outline):        # gets draft's AND outline's outputs
     return {"outline": outline, "article": draft}
 ```
 
-(`@step(name="...")` renames a step; `@step(order=n)` overrides run order; `@step(description="...")` — or the function's docstring — is recorded in the run state and shown by `agentsoup status`.)
+**Named parameters are also the dependency graph.** Steps whose parameters all name earlier steps run as soon as those steps finish — so independent branches run **in parallel**, no extra syntax:
+
+```python
+@step
+def outline(topic): ...
+
+@step
+def facts(outline): ...        # these two only depend on outline,
+@step
+def quotes(outline): ...       # so they run concurrently
+
+@step
+def article(facts, quotes):    # waits for both branches
+    ...
+```
+
+**Fan out** over a list with `@step(fan_out=True)` — the step runs once per item, in parallel, and its output is the list of results. Perfect for fanning out agents:
+
+```python
+@step
+@llm(model="gpt-4.1")
+def subtopics(topic) -> list:
+    return f"List 5 subtopics of {topic} as a JSON array"
+
+@step(fan_out=True)
+@agent(model="gpt-4.1", tools=[search])
+def research(subtopics):               # called once per subtopic, concurrently
+    return "Research this subtopic:", subtopics
+
+@step
+def combine(research):                 # gets the list of all agent answers
+    ...
+```
+
+(`@step(name="...")` renames a step; `@step(order=n)` overrides definition order; `@step(description="...")` — or the docstring — is recorded in the run state; `run(max_workers=n)` caps concurrency.)
 
 Run it from Python or the CLI:
 

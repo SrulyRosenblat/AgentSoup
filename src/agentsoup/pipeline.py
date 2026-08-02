@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -17,16 +18,26 @@ import pydantic
 _seq = itertools.count()
 
 
-def step(fn=None, *, name: str | None = None, order: int | None = None, description: str | None = None):
+def step(
+    fn=None,
+    *,
+    name: str | None = None,
+    order: int | None = None,
+    description: str | None = None,
+    fan_out: bool = False,
+):
     """Mark a function as a pipeline step. Stacks on plain functions, @llm, or @agent
     (put @step outermost). Steps run in definition order unless order= is given.
-    description= (or the docstring) is recorded in the run state file."""
+    description= (or the docstring) is recorded in the run state file.
+    fan_out=True runs the step once per item of its input list, in parallel,
+    and its output becomes the list of results."""
 
     def deco(f):
         f.__agentsoup_step__ = {
             "name": name or f.__name__,
             "order": order,
             "description": description or inspect.getdoc(f),
+            "fan_out": fan_out,
             "seq": next(_seq),
         }
         return f
@@ -69,27 +80,12 @@ def _store_output(step_state: dict, value):
         step_state["output_repr"] = repr(value)[:10_000]
 
 
-def _call_step(step_name: str, fn, prev_value, outputs: dict):
-    """Bind a step's parameters: a param named after an earlier step gets that
-    step's output; one remaining required param gets the previous step's output
-    (the pipeline input, for the first step)."""
-    kwargs = {}
-    unbound = []
-    for pname, p in inspect.signature(fn).parameters.items():
-        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            continue
-        if pname in outputs:
-            kwargs[pname] = outputs[pname]
-        elif p.default is inspect.Parameter.empty:
-            unbound.append(pname)
-    if len(unbound) > 1:
-        raise ValueError(
-            f"Step '{step_name}' has multiple unbound parameters {unbound}; "
-            "name them after earlier steps or give them defaults"
-        )
-    if unbound:
-        kwargs[unbound[0]] = prev_value
-    return fn(**kwargs)
+def _params_of(fn) -> dict:
+    return {
+        n: p
+        for n, p in inspect.signature(fn).parameters.items()
+        if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
 
 
 class PipelineResult(NamedTuple):
@@ -132,9 +128,22 @@ class Pipeline:
         state_dir=".agentsoup/runs",
         webhook_url: str | None = None,
         on_event=None,
+        max_workers: int | None = None,
     ) -> PipelineResult:
+        """Execute the pipeline as a dependency graph.
+
+        A step whose parameters all name earlier steps depends only on those
+        steps and runs as soon as they finish — independent steps run in
+        parallel. A step with an unbound required parameter (or no parameters)
+        depends on the step defined just before it, preserving plain linear
+        chaining. Progress is written atomically to a JSON state file and
+        optionally POSTed to a webhook.
+        """
         if not self.steps:
             raise ValueError(f"No @step functions found in {self.source}")
+        names = [meta["name"] for meta, _ in self.steps]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Duplicate step names: {sorted(n for n in names if names.count(n) > 1)}")
         run_id = run_id or new_run_id(self.source)
         state_path = Path(state_dir) / f"{run_id}.json"
         state = {
@@ -154,13 +163,15 @@ class Pipeline:
                 for i, (meta, _) in enumerate(self.steps)
             ],
         }
+        lock = threading.Lock()
 
         def save():
-            state["updated_at"] = _now()
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = Path(str(state_path) + ".tmp")
-            tmp.write_text(json.dumps(state, indent=2, default=str))
-            os.replace(tmp, state_path)  # atomic: readers never see a partial doc
+            with lock:
+                state["updated_at"] = _now()
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = Path(str(state_path) + ".tmp")
+                tmp.write_text(json.dumps(state, indent=2, default=str))
+                os.replace(tmp, state_path)  # atomic: readers never see a partial doc
 
         def emit(event: str, step_state: dict | None = None):
             if on_event:
@@ -171,19 +182,52 @@ class Pipeline:
                     "timestamp": _now(), "step": step_state, "run_status": state["status"],
                 }, wait=event in ("run_finished", "run_failed"))
 
-        save()
-        emit("run_started")
-        value = input
-        outputs = {}  # step name -> output, for name-based parameter wiring
+        # Dependency graph: named params -> those steps; unbound/no params -> previous step.
+        deps = []
         for i, (meta, fn) in enumerate(self.steps):
+            params = _params_of(fn)
+            named = {n for n in params if n in names[:i]}
+            has_unbound = any(
+                n not in named and p.default is inspect.Parameter.empty for n, p in params.items()
+            )
+            d = set(named)
+            if i > 0 and (has_unbound or not named):
+                d.add(names[i - 1])
+            deps.append(d)
+
+        outputs = {}
+
+        def execute(i: int):
+            meta, fn = self.steps[i]
             step_state = state["steps"][i]
             step_state.update(status="running", started_at=_now())
             started = time.monotonic()
             save()
             emit("step_started", step_state)
             try:
-                value = _call_step(meta["name"], fn, value, outputs)
-                outputs[meta["name"]] = value
+                params = _params_of(fn)
+                kwargs, unbound = {}, []
+                for n, p in params.items():
+                    if n in names[:i]:
+                        kwargs[n] = outputs[n]
+                    elif p.default is inspect.Parameter.empty:
+                        unbound.append(n)
+                if len(unbound) > 1:
+                    raise ValueError(
+                        f"Step '{meta['name']}' has multiple unbound parameters {unbound}; "
+                        "name them after earlier steps or give them defaults"
+                    )
+                if unbound:
+                    kwargs[unbound[0]] = input if i == 0 else outputs[names[i - 1]]
+                if meta.get("fan_out"):
+                    if not kwargs:
+                        raise ValueError(f"fan_out step '{meta['name']}' needs an input parameter")
+                    fan_param = unbound[0] if unbound else next(iter(params))
+                    items = list(kwargs[fan_param])
+                    with ThreadPoolExecutor(max_workers=max_workers) as fan_pool:
+                        value = list(fan_pool.map(lambda item: fn(**{**kwargs, fan_param: item}), items))
+                else:
+                    value = fn(**kwargs)
             except Exception as e:
                 step_state.update(
                     status="failed", finished_at=_now(),
@@ -192,7 +236,6 @@ class Pipeline:
                 state["status"] = "failed"
                 save()
                 emit("step_failed", step_state)
-                emit("run_failed")
                 raise
             step_state.update(
                 status="done", finished_at=_now(), duration_s=round(time.monotonic() - started, 3)
@@ -200,10 +243,36 @@ class Pipeline:
             _store_output(step_state, value)
             save()
             emit("step_finished", step_state)
+            return value
+
+        save()
+        emit("run_started")
+        failure = None
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pending = set(range(len(self.steps)))
+            running = {}
+            while pending or running:
+                if failure is None:
+                    ready = [i for i in sorted(pending) if deps[i] <= set(outputs)]
+                    for i in ready:
+                        pending.discard(i)
+                        running[pool.submit(execute, i)] = i
+                if not running:
+                    break  # a failure stopped scheduling; nothing left in flight
+                completed, _ = _wait(running, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    i = running.pop(future)
+                    try:
+                        outputs[names[i]] = future.result()
+                    except Exception as e:
+                        failure = failure or e
+        if failure is not None:
+            emit("run_failed")
+            raise failure
         state["status"] = "done"
         save()
         emit("run_finished")
-        return PipelineResult(run_id, "done", value, str(state_path))
+        return PipelineResult(run_id, "done", outputs[names[-1]], str(state_path))
 
 
 def load_run(path) -> dict:
