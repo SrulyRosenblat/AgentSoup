@@ -1,149 +1,154 @@
-
-
 # 🥣 AgentSoup
 
 **Mix prompts, models, and logic — cook up LLM-powered functions with ease.**
 
-AgentSoup is a lightweight Python library for turning regular functions into structured, prompt-driven LLM tools. It’s flexible enough for creative or structured outputs, while keeping your code readable and maintainable.
+Write a Python function, return the prompt, get back a typed result. AgentSoup turns functions into LLM calls, agents with tools, and trackable pipelines — all with the same tiny interface.
 
-## Installation
-
-```
+```bash
 pip install agentsoup
 ```
 
-> ✨ Built on top of [`litellm`](https://github.com/BerriAI/litellm), `pydantic`, and composable message objects.
+Works with any provider [litellm](https://docs.litellm.ai) supports (OpenAI, Anthropic, Gemini, …) — set the matching API key env var and pass the model name.
 
----
-
-## 🧠 Why AgentSoup?
-
-* 🥄 **Simple to start** – just decorate a function and return a prompt.
-* 🍲 **Structured responses** – get fully typed outputs using `pydantic`.
-* 🔬 **Complete response mode** – get raw completions *and* parsed data.
-* 🧩 **Composable messages** – use structured message types for flexibility.
-* 🔄 **Model-flexible** – works with OpenAI, Gemini, Mistral, Claude, and more via `litellm`.
-
----
-
-## 📘 Example 1: Sorting Books
+## The idea: return the prompt
 
 ```python
-from pydantic import BaseModel
 from agentsoup import llm
+from pydantic import BaseModel
 
 class Book(BaseModel):
     title: str
+    author: str
 
-class BooksList(BaseModel):
-    books: list[Book]
+@llm(model="gpt-4.1")
+def recommend(topic: str) -> Book:
+    return f"Recommend one great book about {topic}"
 
-@llm(model="gpt-4o-mini")
-def sort_books_by_popularity(book_list: list[str]) -> BooksList:
-    """
-    Sorts books by popularity.
-    """
-    return 'sort the following books by popularity {book_list}'
-
-# Call it like a regular function:
-result = sort_books_by_popularity([
-    'The Great Gatsby', 'To Kill a Mockingbird', '1984',
-    'Pride and Prejudice', 'The Hobbit'
-])
-print(result)
+book = recommend("octopuses")   # Book(title='...', author='...')
 ```
 
----
+The function body builds the prompt; the return **type hint** picks the output: `-> str` (or none) returns text, a pydantic model returns a parsed instance, and `-> CompleteResponse[T]` returns `(parsed, raw_completion)`.
 
-## 🖼️ Example 2: Image Captioning with Full Response
+Any decorated function can be re-tuned without re-defining it — `with_options` returns a copy with merged parameters (any litellm kwarg; on agents also `tools`, `mcp_servers`, `max_turns`):
 
 ```python
-from pydantic import BaseModel
-from agentsoup import llm, UserMessage, Text, LocalImage, CompleteResponse
-
-class ImageDescription(BaseModel):
-    caption: str
-    long_description: str
-
-@llm(model="gpt-4o-mini")
-def describe_image(path: str) -> CompleteResponse[ImageDescription]:
-    """
-    Describes an image.
-    """
-    return [
-        UserMessage(
-            content=[
-                Text('describe the following image:'),
-                LocalImage(image_path=path)
-            ]
-        )
-    ]
-
-response = describe_image('./penguin.jpeg')
-print("Caption:", response.parsed_response.caption)
-print("Description:", response.parsed_response.long_description)
-print("Tokens used:", response.completion.usage.total_tokens)
-
+cheap = recommend.with_options(model="gpt-4.1-mini", temperature=0)
+cheap("octopuses")
 ```
 
----
+## Multimodal: just return the pieces
 
-## 🧪 Example 3: Regex Generator with Gemini
+Strings, file paths, and URLs mix freely in a returned tuple — each becomes the right content part automatically (images, video, audio, PDFs; MIME type detected from the file):
 
 ```python
-import re
-from pydantic import BaseModel
-from agentsoup import llm
+from pathlib import Path
+from agentsoup import llm, system
 
-class Regex(BaseModel):
-    regex_str: str
+@llm(model="gemini/gemini-2.5-flash")
+def analyze(img: str, clip: str) -> str:
+    return "Compare this photo and video:", Path(img), Path(clip)
 
-@llm(model="gemini-2.5-flash")
-def build_regex(text: str) -> Regex:
-    """
-    Builds a regex from a text description.
-    """
-    return f'give regex that does the following: {text}'
-
-text_blob = """
-poe 435-435-4354
-holmes (435) 435-4354
-bob 435.435.4354
-"""
-
-regex = build_regex('extracts all phone numbers from a text in any format').regex_str
-print("Generated Regex:", regex)
-print("Matches:", re.findall(regex, text_blob))
+@llm(model="gpt-4.1")
+def summarize_pdf(url: str) -> str:
+    return system("You are terse."), "Summarize:", url   # e.g. https://x.com/doc.pdf
 ```
 
----
+Explicit part/message types (`Text`, `Image`, `Video`, `Audio`, `File`, `system(...)`, `user(...)`, `assistant(...)`) are there when you want control — each media class takes a local path or URL.
 
-## 📦 Message Types (Optional)
+## Agents: same style, plus tools
 
-AgentSoup supports structured message composition via:
+A tool is any typed Python function with a docstring. Pass it to `@agent` and the model can call it in a loop until it has an answer:
 
-* `UserMessage`
-* `SystemMessage`
-* `Text`
-* `LocalImage`
-* and more..
+```python
+from agentsoup import agent
 
-This allows full control over the message content while keeping function logic clean and focused.
+def get_weather(city: str, units: str = "c") -> str:
+    """Look up current weather for a city."""
+    ...
 
----
+@llm(model="gpt-4.1-mini")
+def summarize(text: str) -> str:
+    """Summarize text in two sentences."""
+    return f"Summarize: {text}"
 
-## 🧠 Coming Soon
+@agent(model="gpt-4.1", tools=[get_weather, summarize], max_turns=10)
+def assistant(question: str) -> str:
+    return question
+```
 
-* 🕵️ Agent mode for goal-driven agents
-* 🧰 Tool & plugin support
-* 🔁 Streaming + iterative refinement modes
-* 🧠 Full Documentation
+Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, so agents can delegate to sub-agents with zero extra syntax. Tool schemas are generated from signatures and type hints; tool errors are fed back to the model instead of crashing.
 
----
+## MCP servers
 
-## 📜 License
+Declare MCP servers the same way as tools — their tools and your Python tools look identical to the model:
 
-MIT
+```python
+from agentsoup import agent, StdioServer, HTTPServer
 
+fs = StdioServer("npx", ["-y", "@modelcontextprotocol/server-filesystem", "./docs"])
+linear = HTTPServer("https://mcp.linear.app/mcp", headers={"Authorization": "Bearer ..."})
 
+@agent(model="gpt-4.1", tools=[get_weather], mcp_servers=[fs, linear])
+def helper(task: str) -> str:
+    return "Complete this task using the available tools:", task
+```
 
+Sessions connect when the function is called and tear down when it returns.
+
+## Pipelines: a file of steps, tracked from anywhere
+
+Mark functions in a file with `@step`; they run in order, each step's output feeding the next. Steps can be plain functions, `@llm`, or `@agent` (put `@step` on top):
+
+```python
+# steps.py
+from agentsoup import step, llm
+
+@step
+@llm(model="gpt-4.1")
+def outline(topic: str) -> str:
+    return f"Write an outline about {topic}"
+
+@step
+@llm(model="gpt-4.1")
+def draft(outline: str) -> str:
+    return "Write a full draft from this outline:", outline
+```
+
+Run it from Python or the CLI:
+
+```bash
+agentsoup run steps.py --input "octopus intelligence" --webhook https://example.com/hook
+agentsoup status                 # list runs:  steps-20260802-101502-a3f9c1  done  2/2 steps ...
+agentsoup status <run_id>        # per-step detail (--json for raw state)
+```
+
+```python
+from agentsoup import Pipeline, load_run, list_runs
+
+result = Pipeline.from_file("steps.py").run(input="octopus intelligence")
+state = load_run(result.state_path)          # from any process, any time
+```
+
+Every run writes a JSON state file to `.agentsoup/runs/<run_id>.json` — updated atomically after each step with status, timings, outputs, and errors — so completion is trackable from another process. Pass `webhook_url=` (or `--webhook`) to also POST `run_started` / `step_finished` / `run_failed` … events as the run progresses.
+
+## API summary
+
+| | |
+|---|---|
+| `@llm(model, **litellm_kwargs)` | function's return value → prompt; return hint → output type |
+| `@agent(model, tools=, mcp_servers=, max_turns=)` | `@llm` plus a native tool-calling loop |
+| `Tool.from_function(fn)` / `Tool(...)` | how callables become tool schemas (automatic in `tools=`) |
+| `StdioServer` / `HTTPServer` | MCP server configs |
+| `@step`, `Pipeline.from_file`, `load_run`, `list_runs` | pipelines + tracking |
+| `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
+| `CompleteResponse[T]` | also get the raw completion |
+| `fn.with_options(**overrides)` | copy of a decorated function with changed parameters |
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+MIT licensed.

@@ -1,0 +1,6 @@
+__pycache__/
+*.egg-info/
+.agentsoup/
+dist/
+build/
+.pytest_cache/
