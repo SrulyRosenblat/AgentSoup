@@ -3,6 +3,7 @@ import functools
 import inspect
 import json
 import shlex
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, NamedTuple, TypeVar, get_args, get_origin, get_type_hints
@@ -29,11 +30,14 @@ class AgentMaxTurnsError(RuntimeError):
         self.messages = messages
 
 
-def _split_return_type(f) -> tuple[type | None, bool]:
-    hint = get_type_hints(f).get("return")
+def _split_return_type_hint(hint) -> tuple[type | None, bool]:
     if get_origin(hint) == CompleteResponse:
         return get_args(hint)[0], True
     return hint, False
+
+
+def _split_return_type(f) -> tuple[type | None, bool]:
+    return _split_return_type_hint(get_type_hints(f).get("return"))
 
 
 def _is_model(t) -> bool:
@@ -129,7 +133,10 @@ def llm(
     """Decorator: the wrapped function's return value becomes the prompt; its
     return type hint picks the output format. With tools= it runs a tool-calling
     loop; tools may be Python functions, other @llm functions, Tool instances,
-    MCP server configs (StdioServer/HTTPServer), or strings (URL or command)."""
+    MCP server configs (StdioServer/HTTPServer), or strings (URL or command).
+
+    Every decorated function also gets ``.map(items)``: call it once per item,
+    in parallel, returning the list of results in order."""
 
     def deco(f):
         return_type, wants_complete = _split_return_type(f)
@@ -140,7 +147,6 @@ def llm(
 
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
-            messages = [m.to_openai_format() for m in coerce(f(*args, **kwargs))]
             if mcp_servers:
                 from .mcp import _open_mcp
 
@@ -155,22 +161,36 @@ def llm(
                 call_kwargs = dict(extra)
                 if all_tools:
                     call_kwargs["tools"] = [t.to_openai_schema() for t in all_tools]
-                for _ in range(max_turns):
-                    response = litellm.completion(model=model, messages=messages, **call_kwargs)
-                    msg = response.choices[0].message
-                    tool_calls = getattr(msg, "tool_calls", None)
-                    if not tool_calls:
-                        return _finalize(response, return_type, wants_complete)
-                    messages.append(msg.model_dump() if hasattr(msg, "model_dump") else msg)
-                    for tc in tool_calls:
-                        try:
-                            out = tool_map[tc.function.name].invoke(json.loads(tc.function.arguments or "{}"))
-                            content = _serialize_result(out)
-                        except Exception as e:  # feed errors back to the model
-                            content = f"Error: {type(e).__name__}: {e}"
-                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
-                raise AgentMaxTurnsError(max_turns, messages)
 
+                def run_one(prompt_value):
+                    messages = [m.to_openai_format() for m in coerce(prompt_value)]
+                    for _ in range(max_turns):
+                        response = litellm.completion(model=model, messages=messages, **call_kwargs)
+                        msg = response.choices[0].message
+                        tool_calls = getattr(msg, "tool_calls", None)
+                        if not tool_calls:
+                            return _finalize(response, return_type, wants_complete)
+                        messages.append(msg.model_dump() if hasattr(msg, "model_dump") else msg)
+                        for tc in tool_calls:
+                            try:
+                                out = tool_map[tc.function.name].invoke(json.loads(tc.function.arguments or "{}"))
+                                content = _serialize_result(out)
+                            except Exception as e:  # feed errors back to the model
+                                content = f"Error: {type(e).__name__}: {e}"
+                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+                    raise AgentMaxTurnsError(max_turns, messages)
+
+                return run_one(f(*args, **kwargs))
+
+        def map_(items, **kwargs):
+            """Call the function once per item, in parallel; results in order."""
+            items = list(items)
+            if not items:
+                return []
+            with ThreadPoolExecutor() as pool:
+                return list(pool.map(lambda item: wrapper(item, **kwargs), items))
+
+        wrapper.map = map_
         wrapper.with_options = lambda **overrides: llm(
             **{"model": model, "tools": tools, "max_turns": max_turns, **llm_kwargs, **overrides}
         )(f)

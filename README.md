@@ -78,6 +78,22 @@ def assistant(question: str) -> str:
 
 Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, so agents can delegate to sub-agents with zero extra syntax. Tool schemas are generated from signatures and type hints; tool errors are fed back to the model instead of crashing.
 
+## Fan out with `.map()`
+
+Every decorated function has `.map(items)` — one call per item, all in parallel, results in order. Because the function body is plain Python that runs before the LLM call, fan-out-and-summarize fits in one function:
+
+```python
+@llm(model="gpt-4.1-mini")
+def summarize(chunk: str) -> str:
+    return "Summarize:", chunk
+
+@llm(model="gpt-4.1")
+def report(chunks) -> str:
+    return "Combine these summaries:", summarize.map(chunks)   # parallel fan-out, then one final call
+```
+
+`.map()` works the same on agents with tools, and extra kwargs are forwarded to every call: `summarize.map(chunks, style="terse")`.
+
 ## MCP servers
 
 MCP servers go in the **same `tools=` list** — as a URL string, a command string, or a config object when you need headers/env:
@@ -140,27 +156,15 @@ def article(facts, quotes):    # waits for both branches
     ...
 ```
 
-**Fan out by yielding.** A step that `yield`s produces a stream: each downstream step runs once per item, in parallel, and the results come back together as a plain list at the next step. Perfect for fanning out agents:
+**Fanning out inside a step** is just `.map()` — a step body is ordinary Python:
 
 ```python
 @step
-def subtopics(topic):
-    for sub in plan(topic):
-        yield sub                      # each item fans out downstream
-
-@step
-@agent(model="gpt-4.1", tools=[search])
-def research(subtopic):                # called once per yielded item, concurrently
-    return "Research this subtopic:", subtopic
-
-@step
-def combine(research):                 # fan-in: the list of all agent answers
-    ...
+def research_all(subtopics):
+    return research.map(subtopics)     # one agent per subtopic, in parallel
 ```
 
-A step that returns a list does *not* fan out (the next step gets the whole list); `yield from items` is the one-line adapter when you want it to. A fanned step that itself yields keeps the stream going, flattened.
-
-(`@step(name="...")` renames a step; `@step(order=n)` overrides definition order; `@step(description="...")` — or the docstring — is recorded in the run state; `run(max_workers=n)` caps concurrency.)
+(`@step(name="...")` renames a step; `@step(order=n)` overrides definition order; `@step(description="...")` — or the docstring — is recorded in the run state; `run(max_workers=n)` caps step concurrency.)
 
 Run it from Python or the CLI:
 
@@ -190,6 +194,7 @@ Every run writes a JSON state file to `.agentsoup/runs/<run_id>.json` — update
 | `@step`, `Pipeline.from_file`, `load_run`, `list_runs` | pipelines + tracking |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
 | `CompleteResponse[T]` | also get the raw completion |
+| `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |
 | `fn.with_options(**overrides)` | copy of a decorated function with changed parameters |
 
 ## Development

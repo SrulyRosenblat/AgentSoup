@@ -280,3 +280,81 @@ def test_non_model_return_hints_parse_via_typeadapter(fake_completion):
 
     assert listy("go") == ["a", "b", "c"]
     assert "response_format" not in fake_completion.calls[0]  # parse-only
+
+
+def _content_keyed_completion(monkeypatch, reply):
+    """Parallel-safe fake: response derived from the prompt content."""
+    import litellm
+
+    def completion(**kwargs):
+        text = kwargs["messages"][0]["content"][0]["text"]
+        return text_response(reply(text))
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+
+def test_map_runs_per_item_and_keeps_order(monkeypatch):
+    _content_keyed_completion(monkeypatch, lambda t: t.upper())
+
+    @llm(model="m")
+    def shout(word: str) -> str:
+        return f"say {word}"
+
+    assert shout.map(["a", "b", "c"]) == ["SAY A", "SAY B", "SAY C"]
+    assert shout.map([]) == []
+
+
+def test_map_runs_in_parallel(monkeypatch):
+    import litellm
+    import threading
+
+    barrier = threading.Barrier(3, timeout=5)
+
+    def completion(**kwargs):
+        barrier.wait()  # all three calls must be in flight simultaneously
+        return text_response(kwargs["messages"][0]["content"][0]["text"])
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")
+    def echo(w: str) -> str:
+        return w
+
+    assert echo.map(["x", "y", "z"]) == ["x", "y", "z"]
+
+
+def test_map_parses_each_result(monkeypatch):
+    _content_keyed_completion(monkeypatch, lambda t: '{"value": %s}' % t)
+
+    @llm(model="m")
+    def num(n: int) -> Answer:
+        return str(n)
+
+    assert num.map([1, 2]) == [Answer(value=1), Answer(value=2)]
+
+
+def test_fanout_and_summarize_in_one_body(monkeypatch):
+    _content_keyed_completion(
+        monkeypatch,
+        lambda t: f"S({t.removeprefix('sum ')})" if t.startswith("sum ") else f"REPORT[{t}]",
+    )
+
+    @llm(model="m")
+    def summarize(chunk: str) -> str:
+        return f"sum {chunk}"
+
+    @llm(model="m")
+    def report(chunks) -> str:
+        return "combine: " + ", ".join(summarize.map(chunks))
+
+    assert report(["a", "b"]) == "REPORT[combine: S(a), S(b)]"
+
+
+def test_map_forwards_kwargs(monkeypatch):
+    _content_keyed_completion(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def greet(name: str, greeting: str = "hi") -> str:
+        return f"{greeting} {name}"
+
+    assert greet.map(["ann", "bob"], greeting="yo") == ["yo ann", "yo bob"]
