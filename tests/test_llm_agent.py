@@ -469,3 +469,91 @@ def test_map_shares_one_mcp_session(monkeypatch, fake_completion):
 
     assert ask.map(["a", "b", "c"], max_workers=1) == ["ok", "ok", "ok"]
     assert len(connects) == 1
+
+
+def test_retries_transient_errors_with_backoff(monkeypatch):
+    import litellm
+    import time as time_mod
+
+    sleeps = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: sleeps.append(s))
+
+    attempts = []
+
+    def completion(**kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise litellm.RateLimitError("slow down", llm_provider="openai", model="m")
+        return text_response("finally")
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")  # default retries=2 -> 3 attempts
+    def ask(q: str) -> str:
+        return q
+
+    assert ask("hi") == "finally"
+    assert len(attempts) == 3
+    assert len(sleeps) == 2 and sleeps[1] > sleeps[0] / 2  # backoff grew (jittered)
+
+
+def test_retries_exhausted_reraises(monkeypatch):
+    import litellm
+    import time as time_mod
+
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    attempts = []
+
+    def completion(**kwargs):
+        attempts.append(1)
+        raise litellm.RateLimitError("slow down", llm_provider="openai", model="m")
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m", retries=1)
+    def ask(q: str) -> str:
+        return q
+
+    with pytest.raises(litellm.RateLimitError):
+        ask("hi")
+    assert len(attempts) == 2  # 1 try + 1 retry
+
+
+def test_non_transient_errors_do_not_retry(monkeypatch):
+    import litellm
+
+    attempts = []
+
+    def completion(**kwargs):
+        attempts.append(1)
+        raise ValueError("bad request")
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with pytest.raises(ValueError):
+        ask("hi")
+    assert len(attempts) == 1
+
+
+def test_retries_zero_disables(monkeypatch):
+    import litellm
+
+    attempts = []
+
+    def completion(**kwargs):
+        attempts.append(1)
+        raise litellm.RateLimitError("slow down", llm_provider="openai", model="m")
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m", retries=0)
+    def ask(q: str) -> str:
+        return q
+
+    with pytest.raises(litellm.RateLimitError):
+        ask("hi")
+    assert len(attempts) == 1

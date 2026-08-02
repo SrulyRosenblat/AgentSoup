@@ -29,6 +29,8 @@ book = recommend("octopuses")   # Book(title='...', author='...')
 
 The function body builds the prompt; the return **type hint** picks the output: `-> str` (or none) returns text, a pydantic model returns a parsed instance, and `-> CompleteResponse[T]` returns `(parsed, raw_completion)`.
 
+Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=2` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables.
+
 Any decorated function can be re-tuned without re-defining it — `with_options` returns a copy with merged parameters (any litellm kwarg; on agents also `tools`, `mcp_servers`, `max_turns`):
 
 ```python
@@ -143,7 +145,7 @@ The state file is updated atomically after every call (name, status, timings, ou
 
 | | |
 |---|---|
-| `@llm(model, tools=, max_turns=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
+| `@llm(model, tools=, max_turns=, retries=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
 | `@agent` | alias of `@llm` — reads better when tools are involved |
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |

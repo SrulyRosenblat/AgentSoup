@@ -3,6 +3,7 @@ import contextvars
 import functools
 import inspect
 import json
+import random
 import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -96,6 +97,27 @@ class Tool:
         )
 
 
+# transient provider errors worth retrying (present across litellm versions)
+_RETRYABLE = tuple(
+    exc for exc in (
+        getattr(litellm, name, None)
+        for name in ("RateLimitError", "APIConnectionError", "Timeout",
+                     "InternalServerError", "ServiceUnavailableError")
+    ) if isinstance(exc, type)
+)
+
+
+def _retry_completion(retries: int, **kwargs):
+    """litellm.completion with exponential backoff + jitter on transient errors."""
+    for attempt in range(retries + 1):
+        try:
+            return litellm.completion(**kwargs)
+        except _RETRYABLE:
+            if attempt == retries:
+                raise
+            time.sleep(min(8.0, 0.5 * 2 ** attempt) * (0.5 + random.random()))
+
+
 def _serialize_result(out) -> str:
     if isinstance(out, str):
         return out
@@ -151,6 +173,7 @@ def llm(
     model: str = "gpt-4.1",
     tools: tuple = (),
     max_turns: int = 10,
+    retries: int = 2,
     **llm_kwargs,
 ):
     """Decorator: the wrapped function's return value becomes the prompt; its
@@ -160,7 +183,10 @@ def llm(
 
     Every decorated function also gets ``.map(items, max_workers=, return_exceptions=)``:
     call it once per item, in parallel, returning the list of results in order.
-    MCP sessions are opened once per outer call (shared across a whole .map)."""
+    MCP sessions are opened once per outer call (shared across a whole .map).
+
+    Transient provider errors (rate limits, timeouts, connection/5xx) are retried
+    ``retries`` times with exponential backoff + jitter (0.5s doubling, 8s cap)."""
     if callable(model):  # bare @llm / @agent without parentheses
         return llm()(model)
 
@@ -198,7 +224,7 @@ def llm(
                 call_kwargs["tools"] = [t.to_openai_schema() for t in all_tools]
             messages = [m.to_openai_format() for m in coerce(f(*args, **kwargs))]
             for _ in range(max_turns):
-                response = litellm.completion(model=model, messages=messages, **call_kwargs)
+                response = _retry_completion(retries, model=model, messages=messages, **call_kwargs)
                 msg = response.choices[0].message
                 tool_calls = getattr(msg, "tool_calls", None)
                 if not tool_calls:
@@ -260,7 +286,8 @@ def llm(
 
         wrapper.map = map_
         wrapper.with_options = lambda **overrides: llm(
-            **{"model": model, "tools": tools, "max_turns": max_turns, **llm_kwargs, **overrides}
+            **{"model": model, "tools": tools, "max_turns": max_turns,
+               "retries": retries, **llm_kwargs, **overrides}
         )(f)
         return wrapper
 
