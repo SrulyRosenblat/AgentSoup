@@ -38,7 +38,7 @@ cheap("octopuses")
 
 ## Multimodal: just return the pieces
 
-Strings, file paths, and URLs mix freely in a returned tuple — each becomes the right content part automatically (images, video, audio, PDFs; MIME type detected from the file):
+Strings, `pathlib.Path`s, and media URLs mix freely in a returned tuple — each becomes the right content part automatically (images, video, audio, PDFs; MIME type detected from the file). Local files must be `Path` objects — bare strings are always sent as text, never sniffed for file paths:
 
 ```python
 from pathlib import Path
@@ -92,7 +92,7 @@ def report(chunks) -> str:
     return "Combine these summaries:", summarize.map(chunks)   # parallel fan-out, then one final call
 ```
 
-`.map()` works the same on agents with tools, and extra kwargs are forwarded to every call: `summarize.map(chunks, style="terse")`.
+`.map()` works the same on agents with tools (MCP sessions are opened once and shared across the whole map), and extra kwargs are forwarded to every call: `summarize.map(chunks, style="terse")`. Control it with `max_workers=` (cap concurrency for rate limits) and `return_exceptions=True` (a failed item yields its exception instead of cancelling the rest).
 
 ## MCP servers
 
@@ -111,7 +111,7 @@ def helper(task: str) -> str:
     return "Complete this task using the available tools:", task
 ```
 
-The model sees MCP tools and Python tools identically. Sessions connect when the function is called and tear down when it returns.
+The model sees MCP tools and Python tools identically; a name collision with one of your Python tools is resolved by prefixing the MCP tool with its server label. Sessions connect when the function is called and tear down when it returns (one shared session for a whole `.map`). Set `timeout=` on a server config for long-running tools.
 
 ## Pipelines and subagents are just functions
 
@@ -137,7 +137,7 @@ with track(webhook_url="https://example.com/hook") as run:
 print(run.state_path)      # .agentsoup/runs/<run_id>.json
 ```
 
-The state file is updated atomically after every call (name, status, timings, output, error), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. Tracking failures never break the run.
+The state file is updated atomically after every call (name, status, timings, output, error), so another process can watch progress live with `load_run(path)` / `list_runs(dir)`. The webhook receives `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` events as they happen. The active run is context-local, so concurrent runs in different threads stay isolated (and it follows into `.map` workers); tracking I/O failures disable tracking with a logged warning — they never break the run itself.
 
 ## API summary
 

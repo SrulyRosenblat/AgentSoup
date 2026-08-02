@@ -17,6 +17,7 @@ class StdioServer:
     args: list = field(default_factory=list)
     env: dict | None = None
     name: str | None = None
+    timeout: float | None = 60  # per tool call, seconds; None = no limit
 
 
 @dataclass
@@ -24,6 +25,7 @@ class HTTPServer:
     url: str
     headers: dict | None = None
     name: str | None = None
+    timeout: float | None = 60  # per tool call, seconds; None = no limit
 
 
 class _LoopThread:
@@ -34,12 +36,14 @@ class _LoopThread:
         self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self._thread.start()
 
-    def run(self, coro, timeout: float = 60):
+    def run(self, coro, timeout: float | None = 60):
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
 
     def stop(self):
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout=5)
+        if not self._thread.is_alive():
+            self.loop.close()
 
 
 def _label(server) -> str:
@@ -79,7 +83,10 @@ async def _connect(stack: AsyncExitStack, server):
 
 @contextmanager
 def _open_mcp(servers):
-    """Connect to servers, yield their tools as Tool objects, tear down on exit.
+    """Connect to servers, yield their tools as (server_label, Tool) pairs,
+    tear down on exit. Sessions are safe to share across threads (every call
+    funnels through run_coroutine_threadsafe), so one _open_mcp can serve a
+    whole .map fan-out.
 
     Setup and teardown of the transports run inside one long-lived coroutine on
     the loop thread — anyio cancel scopes are task-bound, so the AsyncExitStack
@@ -99,8 +106,8 @@ def _open_mcp(servers):
                 for server in servers:
                     session = await _connect(stack, server)
                     for t in (await session.list_tools()).tools:
-                        def invoke(args, _s=session, _n=t.name):
-                            return _result_text(lt.run(_s.call_tool(_n, args)))
+                        def invoke(args, _s=session, _n=t.name, _to=server.timeout):
+                            return _result_text(lt.run(_s.call_tool(_n, args), timeout=_to))
 
                         labeled.append(
                             (_label(server), Tool(t.name, t.description or "", t.input_schema, invoke))
@@ -115,17 +122,12 @@ def _open_mcp(servers):
     done = None
     try:
         labeled, done = ready.result(timeout=60)
-        names = [t.name for _, t in labeled]
-        tools = [
-            Tool(f"{label}__{t.name}", t.description, t.parameters, t.invoke)
-            if names.count(t.name) > 1
-            else t
-            for label, t in labeled
-        ]
-        yield tools
+        yield labeled
     finally:
         if done is not None:
             lt.loop.call_soon_threadsafe(done.set)
+        else:
+            lifecycle.cancel()  # connect hung/failed: unwind the stack so subprocesses die
         try:
             lifecycle.result(timeout=10)
         except Exception:

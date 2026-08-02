@@ -144,3 +144,74 @@ def test_list_runs_ordering(monkeypatch, tmp_path):
     with track(run_id="b", state_dir=tmp_path):
         ask("2")
     assert [r["run_id"] for r in list_runs(tmp_path)] == ["a", "b"]
+
+
+def test_concurrent_tracks_in_threads_are_isolated(monkeypatch, tmp_path):
+    """C1: two threads with their own track() blocks must not cross-record."""
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    def worker(run_id, n):
+        with track(run_id=run_id, state_dir=tmp_path):
+            for i in range(n):
+                ask(f"{run_id}-{i}")
+
+    t1 = threading.Thread(target=worker, args=("ra", 3))
+    t2 = threading.Thread(target=worker, args=("rb", 3))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    ra, rb = load_run(tmp_path / "ra.json"), load_run(tmp_path / "rb.json")
+    assert len(ra["calls"]) == 3 and len(rb["calls"]) == 3
+    assert all(c["output"].startswith("ra-") for c in ra["calls"])
+    assert all(c["output"].startswith("rb-") for c in rb["calls"])
+
+
+def test_nested_track_restores_outer(monkeypatch, tmp_path):
+    """C1: closing an inner track() must restore the outer run, not clear it."""
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(run_id="outer", state_dir=tmp_path):
+        with track(run_id="inner", state_dir=tmp_path):
+            ask("in")
+        ask("out")  # must land in the outer run
+
+    outer = load_run(tmp_path / "outer.json")
+    inner = load_run(tmp_path / "inner.json")
+    assert [c["output"] for c in inner["calls"]] == ["in"]
+    assert [c["output"] for c in outer["calls"]] == ["out"]
+
+
+def test_map_calls_land_in_the_callers_run(monkeypatch, tmp_path):
+    """C1: the caller's run must propagate into .map worker threads."""
+    _content_fake(monkeypatch, lambda t: t.upper())
+
+    @llm(model="m")
+    def shout(w: str) -> str:
+        return w
+
+    with track(run_id="r1", state_dir=tmp_path):
+        shout.map(["a", "b"])
+    assert len(load_run(tmp_path / "r1.json")["calls"]) == 2
+
+
+def test_unwritable_state_dir_never_breaks_the_run(monkeypatch, tmp_path):
+    """C2/C3: tracking I/O failures disable tracking, nothing else."""
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    blocker = tmp_path / "file"
+    blocker.write_text("not a dir")  # state_dir parent is a file -> mkdir fails
+
+    with track(run_id="r1", state_dir=blocker / "runs"):
+        assert ask("hi") == "hi"          # run proceeds
+    assert ask("after") == "after"        # and later untracked calls are unaffected

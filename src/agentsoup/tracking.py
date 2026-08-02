@@ -1,8 +1,13 @@
 """Track every @llm/@agent call inside a `with track():` block — a run's progress
 is written atomically to a JSON state file readable from any other process, and
 optionally POSTed to a webhook. A pipeline is just a Python function; this is
-how you watch one from elsewhere."""
+how you watch one from elsewhere.
+
+The active run is context-local (contextvars), so concurrent runs in different
+threads/tasks don't interfere, and tracking I/O can never fail the tracked run."""
+import contextvars
 import json
+import logging
 import os
 import secrets
 import threading
@@ -13,13 +18,14 @@ from pathlib import Path
 
 import pydantic
 
-_current: "Run | None" = None
+_current: contextvars.ContextVar = contextvars.ContextVar("agentsoup_run", default=None)
 _lock = threading.Lock()
+_logger = logging.getLogger("agentsoup")
 
 
 def current_run() -> "Run | None":
-    """The active tracked Run, if any (used by the decorators)."""
-    return _current
+    """The active tracked Run in this context, if any (used by the decorators)."""
+    return _current.get()
 
 
 def _now() -> str:
@@ -63,14 +69,22 @@ class Run:
             "run_id": self.run_id, "status": "running",
             "created_at": _now(), "updated_at": _now(), "calls": [],
         }
+        self._token = None
+        self._broken = False
 
     def _save(self):
-        with _lock:
-            self.state["updated_at"] = _now()
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = Path(str(self.state_path) + ".tmp")
-            tmp.write_text(json.dumps(self.state, indent=2, default=str))
-            os.replace(tmp, self.state_path)  # atomic: readers never see a partial doc
+        if self._broken:
+            return
+        try:
+            with _lock:
+                self.state["updated_at"] = _now()
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = Path(str(self.state_path) + ".tmp")
+                tmp.write_text(json.dumps(self.state, indent=2, default=str))
+                os.replace(tmp, self.state_path)  # atomic: readers never see a partial doc
+        except Exception:
+            self._broken = True  # tracking must never fail the run
+            _logger.warning("agentsoup tracking disabled: cannot write %s", self.state_path, exc_info=True)
 
     def _emit(self, event: str, call: dict | None = None):
         if self.webhook_url:
@@ -92,28 +106,30 @@ class Run:
         return call
 
     def _finish(self, call: dict, started: float, output):
-        call.update(status="done", finished_at=_now(),
-                    duration_s=round(time.monotonic() - started, 3), output=_jsonable(output))
+        with _lock:
+            call.update(status="done", finished_at=_now(),
+                        duration_s=round(time.monotonic() - started, 3), output=_jsonable(output))
         self._save()
         self._emit("call_finished", call)
 
     def _fail(self, call: dict, started: float, error: BaseException):
-        call.update(status="failed", finished_at=_now(),
-                    duration_s=round(time.monotonic() - started, 3),
-                    error=f"{type(error).__name__}: {error}")
+        with _lock:
+            call.update(status="failed", finished_at=_now(),
+                        duration_s=round(time.monotonic() - started, 3),
+                        error=f"{type(error).__name__}: {error}")
         self._save()
         self._emit("call_failed", call)
 
     def __enter__(self) -> "Run":
-        global _current
-        _current = self
-        self._save()
+        self._save()  # before publishing: a broken state_dir only disables tracking
         self._emit("run_started")
+        self._token = _current.set(self)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        global _current
-        _current = None
+        if self._token is not None:
+            _current.reset(self._token)  # restore any outer run, don't clear it
+            self._token = None
         self.state["status"] = "failed" if exc_type else "done"
         self._save()
         self._emit("run_failed" if exc_type else "run_finished")

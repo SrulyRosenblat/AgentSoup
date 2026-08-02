@@ -77,8 +77,14 @@ def test_prose_containing_a_filename_stays_text(png):
     assert coerce_item(s).content["type"] == "text"
 
 
-def test_existing_path_string_becomes_media(png):
-    assert coerce_item(str(png)).content["type"] == "image_url"
+def test_bare_string_paths_are_never_sniffed(png):
+    # strings are always text — only Path objects load local files
+    assert coerce_item(str(png)).content["type"] == "text"
+
+
+def test_generator_return_values_coerce(png):
+    [msg] = coerce(p for p in ["describe:", png])
+    assert [p.content["type"] for p in msg.parts] == ["text", "image_url"]
 
 
 def test_video_and_audio_local(tmp_path):

@@ -59,22 +59,30 @@ def test_bridge_with_stub_session(monkeypatch):
         return stub
 
     monkeypatch.setattr("agentsoup.mcp._connect", fake_connect)
-    with _open_mcp([StdioServer("dummy")]) as tools:
-        [tool] = tools
+    with _open_mcp([StdioServer("dummy", name="srv")]) as labeled:
+        [(label, tool)] = labeled
+        assert label == "srv"
         assert tool.name == "echo"
         assert tool.parameters["required"] == ["msg"]
         assert tool.invoke({"msg": "hi"}) == "echo: hi"
     assert stub.calls == [("echo", {"msg": "hi"})]
 
 
-def test_bridge_prefixes_colliding_names(monkeypatch):
-    async def fake_connect(stack, server):
-        return _StubSession()
+def test_merge_prefixes_collisions_with_static_and_mcp_tools():
+    from agentsoup import Tool
+    from agentsoup.llm import _merge_tools
 
-    monkeypatch.setattr("agentsoup.mcp._connect", fake_connect)
-    servers = [StdioServer("dummy", name="a"), StdioServer("dummy", name="b")]
-    with _open_mcp(servers) as tools:
-        assert sorted(t.name for t in tools) == ["a__echo", "b__echo"]
+    static = [Tool("echo", "python echo", {"type": "object", "properties": {}}, lambda a: "py")]
+    mcp_pairs = [
+        ("a", Tool("echo", "mcp echo", {"type": "object", "properties": {}}, lambda a: "a")),
+        ("b", Tool("echo", "mcp echo", {"type": "object", "properties": {}}, lambda a: "b")),
+        ("b", Tool("other", "fine", {"type": "object", "properties": {}}, lambda a: "o")),
+    ]
+    merged = _merge_tools(static, mcp_pairs)
+    assert sorted(t.name for t in merged) == ["a__echo", "b__echo", "echo", "other"]
+    # invokers stay attached to the right server
+    by_name = {t.name: t for t in merged}
+    assert by_name["a__echo"].invoke({}) == "a" and by_name["echo"].invoke({}) == "py"
 
 
 def test_real_stdio_server(tmp_path):
@@ -91,7 +99,7 @@ def test_real_stdio_server(tmp_path):
     )
     import sys
 
-    with _open_mcp([StdioServer(sys.executable, [str(server_py)])]) as tools:
-        add = next(t for t in tools if t.name == "add")
+    with _open_mcp([StdioServer(sys.executable, [str(server_py)])]) as labeled:
+        add = next(t for _, t in labeled if t.name == "add")
         assert add.description == "Add two numbers."
         assert "5" in add.invoke({"a": 2, "b": 3})

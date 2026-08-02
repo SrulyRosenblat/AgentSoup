@@ -3,6 +3,7 @@ import base64
 import json
 import mimetypes
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -114,8 +115,8 @@ def _part_for(src, mime: str) -> MessagePart:
         return Image(src)
     if mime.startswith("video/"):
         return Video(src)
-    if mime.startswith("audio/") and not _is_url(src):
-        return Audio(src)
+    if mime.startswith("audio/"):
+        return Audio(src)  # raises a clear error for URLs
     return File(src, mime=mime)
 
 
@@ -136,12 +137,11 @@ def coerce_item(item) -> MessagePart:
         mime = mimetypes.guess_type(str(item))[0] or "application/octet-stream"
         return _part_for(str(item), mime)
     if isinstance(item, str):
+        # Bare strings are always text — use pathlib.Path for local files.
+        # (Sniffing os.path.exists on prompt strings would silently upload any
+        # local file a user-supplied string happens to name.)
         if _is_url(item):
             mime = _media_mime(urlparse(item).path)
-            if mime:
-                return _part_for(item, mime)
-        elif os.path.exists(item):
-            mime = _media_mime(item)
             if mime:
                 return _part_for(item, mime)
         return Text(item)
@@ -164,6 +164,8 @@ def coerce(value) -> list[Message]:
         return [value]
     if isinstance(value, str):
         return [Message("user", [Text(value)])]
+    if isinstance(value, Iterator):  # generators etc. — don't stringify the object
+        value = tuple(value)
     if not isinstance(value, (list, tuple)):
         value = (value,)
     if not value:

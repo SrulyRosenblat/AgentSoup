@@ -181,17 +181,15 @@ def test_llm_function_is_a_valid_tool(fake_completion):
     assert fake_completion.calls[2]["messages"][2]["content"] == "inner summary"
 
 
-def test_duplicate_tool_names_rejected(fake_completion):
+def test_duplicate_tool_names_rejected_at_decoration():
     def t() -> str:
         """T."""
         return "x"
 
-    @agent(model="m", tools=[t, Tool("t", "dup", {"type": "object", "properties": {}}, lambda a: "y")])
-    def ask(q: str) -> str:
-        return q
-
     with pytest.raises(ValueError, match="Duplicate tool names"):
-        ask("hi")
+        @agent(model="m", tools=[t, Tool("t", "dup", {"type": "object", "properties": {}}, lambda a: "y")])
+        def ask(q: str) -> str:
+            return q
 
 
 def test_with_options_overrides_llm_params(fake_completion):
@@ -279,7 +277,9 @@ def test_non_model_return_hints_parse_via_typeadapter(fake_completion):
         return q
 
     assert listy("go") == ["a", "b", "c"]
-    assert "response_format" not in fake_completion.calls[0]  # parse-only
+    rf = fake_completion.calls[0]["response_format"]  # JSON guidance from TypeAdapter
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["schema"]["type"] == "array"
 
 
 def _content_keyed_completion(monkeypatch, reply):
@@ -358,3 +358,114 @@ def test_map_forwards_kwargs(monkeypatch):
         return f"{greeting} {name}"
 
     assert greet.map(["ann", "bob"], greeting="yo") == ["yo ann", "yo bob"]
+
+
+def test_bare_decorator_without_parentheses(fake_completion):
+    fake_completion.queue.append(text_response("ok"))
+
+    @llm
+    def ask(q: str) -> str:
+        return q
+
+    assert ask("hi") == "ok"
+
+
+def test_content_none_raises_clear_error(fake_completion):
+    from types import SimpleNamespace
+
+    fake_completion.queue.append(SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=None, tool_calls=None), finish_reason="content_filter")]))
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with pytest.raises(RuntimeError, match="no content.*content_filter"):
+        ask("hi")
+
+
+def test_map_return_exceptions_keeps_partial_results(monkeypatch):
+    import litellm
+
+    def completion(**kwargs):
+        text = kwargs["messages"][0]["content"][0]["text"]
+        if text == "bad":
+            raise RuntimeError("rate limited")
+        return text_response(text.upper())
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")
+    def shout(w: str) -> str:
+        return w
+
+    results = shout.map(["a", "bad", "c"], return_exceptions=True)
+    assert results[0] == "A" and results[2] == "C"
+    assert isinstance(results[1], RuntimeError)
+    with pytest.raises(RuntimeError):
+        shout.map(["a", "bad"])  # default: raise
+
+
+def test_map_max_workers_bounds_concurrency(monkeypatch):
+    import litellm
+    import threading
+
+    active, peak = [0], [0]
+    lock = threading.Lock()
+
+    def completion(**kwargs):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        import time as _t
+        _t.sleep(0.02)
+        with lock:
+            active[0] -= 1
+        return text_response("x")
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    @llm(model="m")
+    def ask(w: str) -> str:
+        return w
+
+    ask.map(list("abcdefgh"), max_workers=2)
+    assert peak[0] <= 2
+
+
+def test_empty_tool_string_rejected():
+    with pytest.raises(ValueError, match="Empty string"):
+        @llm(model="m", tools=["  "])
+        def ask(q: str) -> str:
+            return q
+
+
+def test_map_shares_one_mcp_session(monkeypatch, fake_completion):
+    """I4: a .map over an MCP-equipped agent opens the server once, not per item."""
+    from types import SimpleNamespace
+
+    connects = []
+
+    class Stub:
+        async def initialize(self):
+            pass
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    async def fake_connect(stack, server):
+        connects.append(1)
+        return Stub()
+
+    monkeypatch.setattr("agentsoup.mcp._connect", fake_connect)
+    from agentsoup import StdioServer
+
+    for _ in range(3):
+        fake_completion.queue.append(text_response("ok"))
+
+    @agent(model="m", tools=[StdioServer("dummy")])
+    def ask(q: str) -> str:
+        return q
+
+    assert ask.map(["a", "b", "c"], max_workers=1) == ["ok", "ok", "ok"]
+    assert len(connects) == 1
