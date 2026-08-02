@@ -126,6 +126,32 @@ def write_article(topic):                       # the whole pipeline
     return edit(sections)                       # fan in
 ```
 
+## Validation is just a loop
+
+There is no requirements/verifier framework either — a judge is just another `@llm` function, and validate-and-repair is a `for` loop:
+
+```python
+class Verdict(BaseModel):
+    passed: bool
+    feedback: str
+
+@llm(model="gpt-4.1-mini")
+def judge(draft: str, rules: str) -> Verdict:
+    return f"Check this draft against the rules: {rules}", draft
+
+def reliable_write(topic, rules, budget=3):
+    feedback = ""
+    for _ in range(budget):
+        draft = write(topic, feedback)
+        verdict = judge(draft, rules)
+        if verdict.passed:
+            return draft
+        feedback = verdict.feedback
+    return draft
+```
+
+Deterministic checks are an `if`; a judge panel is `judge.map(...)`; best-of-N is `write.map([topic] * 5)` plus picking the winner; escalation is `write.with_options(model=...)` on the last attempt.
+
 ## Tracking: watch any run from anywhere
 
 Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — is recorded:
