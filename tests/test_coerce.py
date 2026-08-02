@@ -121,3 +121,30 @@ def test_pydantic_and_dict_become_json_text():
 def test_single_loose_value_coerces(png):
     [msg] = coerce(png)
     assert msg.parts[0].content["type"] == "image_url"
+
+
+def test_from_openai_format_round_trips():
+    cases = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "http://x/a.png"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "result text"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+         "reasoning_content": "thinking..."},
+    ]
+    for d in cases:
+        m = Message.from_openai_format(d)
+        out = m.to_openai_format()
+        assert out["role"] == d["role"]
+        if isinstance(d["content"], str):
+            assert out["content"] == [{"type": "text", "text": d["content"]}]  # semantic round trip
+        else:
+            assert out["content"] == d["content"]
+        for k, v in d.items():
+            if k not in ("role", "content"):
+                assert out[k] == v
+
+
+def test_from_openai_format_strips_none_extras():
+    m = Message.from_openai_format({"role": "assistant", "content": "hi", "function_call": None, "audio": None})
+    assert m.extra == {}
+    assert m.to_openai_format() == {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}

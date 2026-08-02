@@ -152,7 +152,21 @@ while (msg := input("> ")):
     history += [user(msg), assistant(answer)]
 ```
 
-Windowing is `history[-20:]`; branching a conversation is copying the list (`reply.map` over variants works too); persistence is `json.dumps([m.to_openai_format() for m in history])`. Structured outputs mid-conversation just work — `assistant(some_pydantic_obj)` serializes it as JSON.
+The loop above carries answers but not the agent's internal tool activity. To continue with **full context** — reasoning, tool calls, and tool results included — annotate `-> CompleteResponse[...]` and make the returned transcript the next history:
+
+```python
+@agent(model="gpt-4.1", tools=[search], system="You are a research assistant.")
+def turn(history, msg: str) -> CompleteResponse[str]:
+    return *history, msg
+
+history = []
+while (msg := input("> ")):
+    resp = turn(history, msg)
+    print(resp.parsed_response)
+    history = resp.messages     # full transcript: the next turn sees every tool call + result
+```
+
+Windowing is `history[-20:]`; branching a conversation is copying the list (`turn.map` over variants works too); persistence is `json.dumps([m.to_openai_format() for m in history])` and back via `Message.from_openai_format`. Structured outputs mid-conversation just work — `assistant(some_pydantic_obj)` serializes it as JSON.
 
 ## Validation is just a loop
 
@@ -205,7 +219,7 @@ The state file is updated atomically after every call (name, status, timings, ou
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
 | `track()`, `load_run`, `list_runs` | record every call in a block to a state file + webhook |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
-| `CompleteResponse[T]` | also get the raw completion |
+| `CompleteResponse[T]` | also get the raw completion + full transcript (`.messages`) for full-context continuation |
 | `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |
 | `fn.with_options(**overrides)` | copy of a decorated function with changed parameters |
 

@@ -608,3 +608,71 @@ def test_no_system_by_default(fake_completion):
 
     ask("hi")
     assert fake_completion.calls[0]["messages"][0]["role"] == "user"
+
+
+def test_complete_response_carries_full_transcript(fake_completion):
+    def get_weather(city: str) -> str:
+        """Weather."""
+        return "sunny"
+
+    fake_completion.queue.append(tool_call_response([("call_1", "get_weather", {"city": "NYC"})]))
+    fake_completion.queue.append(text_response("It is sunny."))
+
+    @agent(model="m", tools=[get_weather], system="Be helpful.")
+    def turn(history, msg: str) -> CompleteResponse[str]:
+        return *history, msg
+
+    resp = turn([], "weather in NYC?")
+    assert resp.parsed_response == "It is sunny."
+    roles = [m.role for m in resp.messages]
+    assert roles == ["system", "user", "assistant", "tool", "assistant"]
+    assert resp.messages[2].extra["tool_calls"][0]["id"] == "call_1"
+    assert resp.messages[3].extra["tool_call_id"] == "call_1"
+
+
+def test_continuing_with_full_context(fake_completion):
+    """Feeding resp.messages back as history sends the tool traffic verbatim."""
+    def get_weather(city: str) -> str:
+        """Weather."""
+        return "sunny"
+
+    fake_completion.queue.append(tool_call_response([("call_1", "get_weather", {"city": "NYC"})]))
+    fake_completion.queue.append(text_response("It is sunny."))
+    fake_completion.queue.append(text_response("You asked about NYC."))
+
+    @agent(model="m", tools=[get_weather])
+    def turn(history, msg: str) -> CompleteResponse[str]:
+        return *history, msg
+
+    first = turn([], "weather in NYC?")
+    second = turn(first.messages, "what city did I ask about?")
+    assert second.parsed_response == "You asked about NYC."
+
+    sent = fake_completion.calls[2]["messages"]  # third completion call
+    roles = [m["role"] for m in sent]
+    assert roles == ["user", "assistant", "tool", "assistant", "user"]
+    assert sent[1]["tool_calls"][0]["id"] == "call_1"       # earlier tool call carried
+    assert sent[2]["tool_call_id"] == "call_1"
+    assert sent[2]["content"] == [{"type": "text", "text": "sunny"}]  # semantic round trip
+
+
+def test_transcript_persists_through_json(fake_completion):
+    import json as json_mod
+    from agentsoup import Message
+
+    def get_weather(city: str) -> str:
+        """Weather."""
+        return "sunny"
+
+    fake_completion.queue.append(tool_call_response([("c1", "get_weather", {"city": "NYC"})]))
+    fake_completion.queue.append(text_response("Sunny."))
+
+    @agent(model="m", tools=[get_weather])
+    def turn(history, msg: str) -> CompleteResponse[str]:
+        return *history, msg
+
+    resp = turn([], "weather?")
+    blob = json_mod.dumps([m.to_openai_format() for m in resp.messages])       # save
+    restored = [Message.from_openai_format(d) for d in json_mod.loads(blob)]   # load
+    assert [m.role for m in restored] == [m.role for m in resp.messages]
+    assert restored[1].extra["tool_calls"][0]["id"] == "c1"

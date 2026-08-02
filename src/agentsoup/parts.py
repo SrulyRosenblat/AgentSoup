@@ -84,12 +84,27 @@ class File(MessagePart):
 
 
 class Message:
-    def __init__(self, role: str, parts):
+    def __init__(self, role: str, parts, **extra):
         self.role = role
         self.parts = list(parts)
+        self.extra = extra  # passthrough: tool_calls, tool_call_id, reasoning_content, ...
 
     def to_openai_format(self) -> dict:
-        return {"role": self.role, "content": [p.to_openai_format() for p in self.parts]}
+        content = [p.to_openai_format() for p in self.parts] if self.parts else None
+        return {"role": self.role, "content": content, **self.extra}
+
+    @classmethod
+    def from_openai_format(cls, d: dict) -> "Message":
+        """Rebuild a Message from an OpenAI-format dict (e.g. persisted history)."""
+        content = d.get("content")
+        if isinstance(content, str):
+            parts = [Text(content)]
+        elif content is None:
+            parts = []
+        else:
+            parts = [MessagePart(**p) for p in content]
+        extra = {k: v for k, v in d.items() if k not in ("role", "content") and v is not None}
+        return cls(d["role"], parts, **extra)
 
     def __repr__(self):
         return str(self.to_openai_format())

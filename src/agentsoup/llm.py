@@ -20,10 +20,13 @@ T = TypeVar("T")
 
 
 class CompleteResponse(NamedTuple, Generic[T]):
-    """Annotate a return type as CompleteResponse[T] to also get the raw completion."""
+    """Annotate a return type as CompleteResponse[T] to also get the raw completion
+    and the full transcript (incl. reasoning, tool calls, and tool results) as
+    Messages — feed .messages back as history to continue with full context."""
 
     parsed_response: T
     completion: object
+    messages: list = []
 
 
 class AgentMaxTurnsError(RuntimeError):
@@ -47,7 +50,7 @@ def _is_model(t) -> bool:
     return isinstance(t, type) and issubclass(t, pydantic.BaseModel)
 
 
-def _finalize(response, return_type, wants_complete):
+def _finalize(response, return_type, wants_complete, transcript=()):
     content = response.choices[0].message.content
     if content is None:
         finish = getattr(response.choices[0], "finish_reason", None)
@@ -58,7 +61,9 @@ def _finalize(response, return_type, wants_complete):
         parsed = return_type.model_validate_json(content)
     else:  # list[str], dict, dataclass, ... — anything pydantic can adapt
         parsed = pydantic.TypeAdapter(return_type).validate_json(content)
-    return CompleteResponse(parsed, response) if wants_complete else parsed
+    if wants_complete:
+        return CompleteResponse(parsed, response, [Message.from_openai_format(m) for m in transcript])
+    return parsed
 
 
 @dataclass
@@ -240,7 +245,9 @@ def llm(
                 msg = response.choices[0].message
                 tool_calls = getattr(msg, "tool_calls", None)
                 if not tool_calls:
-                    return _finalize(response, return_type, wants_complete)
+                    final = msg.model_dump() if hasattr(msg, "model_dump") else {
+                        "role": "assistant", "content": msg.content}
+                    return _finalize(response, return_type, wants_complete, [*messages, final])
                 messages.append(msg.model_dump() if hasattr(msg, "model_dump") else msg)
                 for tc in tool_calls:
                     try:
