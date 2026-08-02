@@ -136,25 +136,11 @@ def write_article(topic):                       # the whole pipeline
 
 ## Chat is a list
 
-No session or context objects — history is a plain list of messages you own. Splat it into the returned tuple; the trailing loose value becomes the new user message:
+No session or context objects — history is a plain list you own, and you never need to build messages by hand. Splat the history into the returned tuple (the trailing loose value becomes the new user message), and take the next history from `resp.messages` — the call's full transcript, including reasoning, tool calls, and tool results:
 
 ```python
-from agentsoup import llm, user, assistant
+from agentsoup import agent, CompleteResponse
 
-@llm(model="gpt-4.1", system="You are a helpful assistant.")
-def reply(history, msg: str) -> str:
-    return *history, msg
-
-history = []
-while (msg := input("> ")):
-    answer = reply(history, msg)
-    print(answer)
-    history += [user(msg), assistant(answer)]
-```
-
-The loop above carries answers but not the agent's internal tool activity. To continue with **full context** — reasoning, tool calls, and tool results included — annotate `-> CompleteResponse[...]` and make the returned transcript the next history:
-
-```python
 @agent(model="gpt-4.1", tools=[search], system="You are a research assistant.")
 def turn(history, msg: str) -> CompleteResponse[str]:
     return *history, msg
@@ -163,8 +149,10 @@ history = []
 while (msg := input("> ")):
     resp = turn(history, msg)
     print(resp.parsed_response)
-    history = resp.messages     # full transcript: the next turn sees every tool call + result
+    history = resp.messages     # next turn continues with everything the model saw and did
 ```
+
+The explicit message helpers (`user(...)`, `assistant(...)`, `system(...)`) exist for when you want manual control — few-shot examples, editing or compacting history, or a lighter history that keeps only `[user(msg), assistant(answer)]` pairs and drops tool traffic.
 
 Windowing is `history[-20:]`; branching a conversation is copying the list (`turn.map` over variants works too); persistence is `json.dumps([m.to_openai_format() for m in history])` and back via `Message.from_openai_format`. Structured outputs mid-conversation just work — `assistant(some_pydantic_obj)` serializes it as JSON.
 
