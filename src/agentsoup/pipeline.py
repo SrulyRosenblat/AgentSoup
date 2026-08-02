@@ -17,12 +17,18 @@ import pydantic
 _seq = itertools.count()
 
 
-def step(fn=None, *, name: str | None = None, order: int | None = None):
+def step(fn=None, *, name: str | None = None, order: int | None = None, description: str | None = None):
     """Mark a function as a pipeline step. Stacks on plain functions, @llm, or @agent
-    (put @step outermost). Steps run in definition order unless order= is given."""
+    (put @step outermost). Steps run in definition order unless order= is given.
+    description= (or the docstring) is recorded in the run state file."""
 
     def deco(f):
-        f.__agentsoup_step__ = {"name": name or f.__name__, "order": order, "seq": next(_seq)}
+        f.__agentsoup_step__ = {
+            "name": name or f.__name__,
+            "order": order,
+            "description": description or inspect.getdoc(f),
+            "seq": next(_seq),
+        }
         return f
 
     return deco(fn) if fn is not None else deco
@@ -140,7 +146,8 @@ class Pipeline:
             "input_repr": None if input is None else repr(input)[:1_000],
             "steps": [
                 {
-                    "name": meta["name"], "index": i, "status": "pending", "started_at": None,
+                    "name": meta["name"], "description": meta.get("description"),
+                    "index": i, "status": "pending", "started_at": None,
                     "finished_at": None, "duration_s": None, "output_json": None,
                     "output_repr": None, "error": None,
                 }

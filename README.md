@@ -122,7 +122,7 @@ def publish(draft, outline):        # gets draft's AND outline's outputs
     return {"outline": outline, "article": draft}
 ```
 
-(`@step(name="...")` renames a step; `@step(order=n)` overrides run order.)
+(`@step(name="...")` renames a step; `@step(order=n)` overrides run order; `@step(description="...")` — or the function's docstring — is recorded in the run state and shown by `agentsoup status`.)
 
 Run it from Python or the CLI:
 

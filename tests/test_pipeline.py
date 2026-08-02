@@ -270,3 +270,28 @@ def bad(a, b):
         pipeline.run(state_dir=tmp_path / "runs", run_id="r1")
     state = load_run(tmp_path / "runs" / "r1.json")
     assert state["status"] == "failed"
+
+
+def test_step_description_in_state(tmp_path):
+    src = """
+from agentsoup import step
+
+@step(description="Doubles the input")
+def double(x):
+    return x * 2
+
+@step
+def label(x):
+    '''Wrap in a dict.'''
+    return {"v": x}
+
+@step
+def bare(x):
+    return x
+"""
+    pipeline = Pipeline.from_file(write_pipeline(tmp_path, src))
+    result = pipeline.run(input=2, state_dir=tmp_path / "runs")
+    steps = load_run(result.state_path)["steps"]
+    assert steps[0]["description"] == "Doubles the input"
+    assert steps[1]["description"] == "Wrap in a dict."  # docstring fallback
+    assert steps[2]["description"] is None

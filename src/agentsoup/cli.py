@@ -54,7 +54,8 @@ def main(argv=None) -> int:
         for s in run["steps"]:
             duration = f" {s['duration_s']}s" if s["duration_s"] is not None else ""
             error = f" — {s['error']}" if s["error"] else ""
-            print(f"  {s['index'] + 1}. {s['name']}: {s['status']}{duration}{error}")
+            description = f"  ({s['description']})" if s.get("description") else ""
+            print(f"  {s['index'] + 1}. {s['name']}: {s['status']}{duration}{error}{description}")
         return 0
 
     runs = list_runs(args.state_dir)
