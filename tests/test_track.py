@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agentsoup import llm, state_file, track, webhook
+from agentsoup import llm, track
 from tests.conftest import text_response
 
 
@@ -35,7 +35,7 @@ def test_state_file_records_a_plain_function_pipeline(monkeypatch, tmp_path):
     def pipeline(topic):  # a pipeline is just a function
         return draft(outline(topic))
 
-    with track(state_file(tmp_path), run_id="r1"):
+    with track(track.state_file(tmp_path), run_id="r1"):
         result = pipeline("fish")
 
     assert result == "DRAFT OUTLINE FISH"
@@ -80,7 +80,7 @@ def test_failure_marks_run_and_reraises(monkeypatch, tmp_path):
         return q
 
     with pytest.raises(RuntimeError, match="provider down"):
-        with track(state_file(tmp_path), run_id="r1"):
+        with track(track.state_file(tmp_path), run_id="r1"):
             ask("hi")
 
     state = read_state(tmp_path, "r1")
@@ -148,7 +148,7 @@ def test_webhook_sink_posts_events(monkeypatch):
     def ask(q: str) -> str:
         return q
 
-    with track(webhook("http://x/hook", headers={"Authorization": "Bearer t"}), run_id="r1"):
+    with track(track.webhook("http://x/hook", headers={"Authorization": "Bearer t"}), run_id="r1"):
         ask("hi")
 
     assert [e["event"] for e, _ in sent] == ["run_started", "call_started", "call_finished", "run_finished"]
@@ -167,7 +167,7 @@ def test_webhook_failure_never_breaks_run(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(webhook("http://down.example"), run_id="r1"):
+    with track(track.webhook("http://down.example"), run_id="r1"):
         assert ask("hi") == "hi"
 
 
@@ -205,7 +205,7 @@ def test_state_readable_from_elsewhere_mid_run(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(state_file(tmp_path), run_id="r1"):
+    with track(track.state_file(tmp_path), run_id="r1"):
         ask("hi")
 
     assert observed["mid"]["status"] == "running"
@@ -215,7 +215,7 @@ def test_state_readable_from_elsewhere_mid_run(monkeypatch, tmp_path):
 
 def test_concurrent_tracks_in_threads_are_isolated(monkeypatch, tmp_path):
     _content_fake(monkeypatch, lambda t: t)
-    sink = state_file(tmp_path)  # one sink instance shared across runs is fine
+    sink = track.state_file(tmp_path)  # one sink instance shared across runs is fine
 
     @llm(model="m")
     def ask(q: str) -> str:
@@ -243,8 +243,8 @@ def test_nested_track_restores_outer(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(state_file(tmp_path), run_id="outer"):
-        with track(state_file(tmp_path), run_id="inner"):
+    with track(track.state_file(tmp_path), run_id="outer"):
+        with track(track.state_file(tmp_path), run_id="inner"):
             ask("in")
         ask("out")  # must land in the outer run
 
@@ -259,7 +259,7 @@ def test_map_calls_land_in_the_callers_run(monkeypatch, tmp_path):
     def shout(w: str) -> str:
         return w
 
-    with track(state_file(tmp_path), run_id="r1"):
+    with track(track.state_file(tmp_path), run_id="r1"):
         shout.map(["a", "b"])
     assert len(read_state(tmp_path, "r1")["calls"]) == 2
 
@@ -274,7 +274,7 @@ def test_unwritable_state_dir_never_breaks_the_run(monkeypatch, tmp_path):
     blocker = tmp_path / "file"
     blocker.write_text("not a dir")  # state_dir parent is a file -> mkdir fails
 
-    with track(state_file(blocker / "runs"), run_id="r1"):
+    with track(track.state_file(blocker / "runs"), run_id="r1"):
         assert ask("hi") == "hi"          # sink disabled with a warning, run proceeds
     assert ask("after") == "after"        # later untracked calls unaffected
 
@@ -294,7 +294,7 @@ def test_usage_recorded_per_call_and_totalled(monkeypatch, tmp_path):
     def ask(q: str) -> str:
         return q
 
-    with track(state_file(tmp_path), run_id="r1"):
+    with track(track.state_file(tmp_path), run_id="r1"):
         ask("a")
         ask("b")
 
@@ -306,7 +306,7 @@ def test_usage_recorded_per_call_and_totalled(monkeypatch, tmp_path):
 
 
 def test_otel_sink_spans(monkeypatch):
-    from agentsoup import otel
+    
 
     _content_fake(monkeypatch, lambda t: t)
     spans = []
@@ -334,7 +334,7 @@ def test_otel_sink_spans(monkeypatch):
     def ask(q: str) -> str:
         return q
 
-    with track(otel(tracer=FakeTracer()), run_id="r1"):
+    with track(track.otel(tracer=FakeTracer()), run_id="r1"):
         ask("hi")
 
     [span] = spans

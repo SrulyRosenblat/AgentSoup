@@ -187,14 +187,14 @@ Deterministic checks are an `if`; a judge panel is `judge.map(...)`; best-of-N i
 Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — emits a plain JSON-serializable event dict to your sinks. A sink is any callable taking one dict:
 
 ```python
-from agentsoup import track, state_file, webhook, otel
+from agentsoup import track
 
-with track() as run_id:                        # default sink: state_file(".agentsoup/runs")
+with track() as run_id:                        # default sink: track.state_file(".agentsoup/runs")
     write_article("octopus intelligence")
 
-with track(state_file("runs/"),                # combine any sinks
-           webhook("https://example.com/hook", headers={"Authorization": "Bearer ..."}),
-           otel()):                            # pip install agentsoup[otel]
+with track(track.state_file("runs/"),          # combine any sinks
+           track.webhook("https://example.com/hook", headers={"Authorization": "Bearer ..."}),
+           track.otel()):                      # pip install agentsoup[otel]
     write_article(topic)
 
 with track(print): ...                         # instant debugger
@@ -204,7 +204,7 @@ with track(events.append): ...                 # capture for tests/analysis
 
 Events: `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` (or `run_failed`), each carrying `run_id`, `time`, and for calls: `call_id`, `name`, `duration_s`, `output` or `error`, and `usage` (LLM calls, prompt/completion tokens, estimated USD cost).
 
-The shipped sinks: `state_file(dir)` maintains `<dir>/<run_id>.json` — a full snapshot rewritten atomically after every event (with run-level usage totals), so another process can watch live with `json.loads(path.read_text())`; `webhook(url, headers=)` POSTs each event (terminal events block so process exit can't drop them); `otel()` opens one OpenTelemetry span per call with usage/cost attributes, feeding whatever tracer provider you've configured.
+The shipped sinks hang off `track` itself: `track.state_file(dir)` maintains `<dir>/<run_id>.json` — a full snapshot rewritten atomically after every event (with run-level usage totals), so another process can watch live with `json.loads(path.read_text())`; `track.webhook(url, headers=)` POSTs each event (terminal events block so process exit can't drop them); `track.otel()` opens one OpenTelemetry span per call with usage/cost attributes, feeding whatever tracer provider you've configured.
 
 The library owns the correctness so your sinks can be naive: sink calls are serialized under a lock (safe under `.map` fan-out), the active tracker is context-local (concurrent runs in different threads stay isolated; nested blocks restore the outer), and a sink that raises is disabled with a logged warning — tracking can never fail the run.
 
@@ -217,7 +217,7 @@ The library owns the correctness so your sinks can be naive: sink calls are seri
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
 | `track(*sinks, run_id=)` | emit every call in a block as event dicts; a sink is any callable |
-| `state_file(dir)` / `webhook(url, headers=)` / `otel()` | shipped sinks: live JSON snapshot, HTTP push, OpenTelemetry spans |
+| `track.state_file(dir)` / `track.webhook(url, headers=)` / `track.otel()` | shipped sinks: live JSON snapshot, HTTP push, OpenTelemetry spans |
 | `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
 | `CompleteResponse[T]` | also get the raw completion + full transcript (`.messages`) for full-context continuation |
 | `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |

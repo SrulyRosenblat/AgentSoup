@@ -169,7 +169,7 @@ def webhook(url: str, headers: dict | None = None, timeout: float = 3.0):
     return sink
 
 
-def otel(tracer=None):
+def otel(tracer=None):  # noqa: D103 — attached below as track.otel
     """Sink: one OpenTelemetry span per call, with usage/cost as attributes.
     Uses the globally configured tracer provider unless tracer= is given.
     Requires opentelemetry-api (pip install agentsoup[otel])."""
@@ -203,3 +203,9 @@ def otel(tracer=None):
             span.end()
 
     return sink
+
+
+# the sinks hang off track itself: track.state_file(), track.webhook(), track.otel()
+track.state_file = state_file
+track.webhook = webhook
+track.otel = otel
