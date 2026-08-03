@@ -83,6 +83,12 @@ class File(MessagePart):
             )
 
 
+# message fields a provider accepts on the way *in*; everything else a response
+# carries (reasoning_content, annotations, provider_specific_fields, ...) is
+# dropped when a transcript is replayed as history.
+REPLAYABLE_FIELDS = frozenset({"tool_calls", "tool_call_id", "name", "thinking_blocks"})
+
+
 class Message:
     def __init__(self, role: str, parts, **extra):
         self.role = role
@@ -95,7 +101,9 @@ class Message:
 
     @classmethod
     def from_openai_format(cls, d: dict) -> "Message":
-        """Rebuild a Message from an OpenAI-format dict (e.g. persisted history)."""
+        """Rebuild a Message from an OpenAI-format dict (e.g. a transcript or
+        persisted history). Response-only fields that providers reject on the
+        way back in (reasoning_content, annotations, ...) are dropped."""
         content = d.get("content")
         if isinstance(content, str):
             parts = [Text(content)]
@@ -103,7 +111,10 @@ class Message:
             parts = []
         else:
             parts = [MessagePart(**p) for p in content]
-        extra = {k: v for k, v in d.items() if k not in ("role", "content") and v is not None}
+        extra = {
+            k: v for k, v in d.items()
+            if k in REPLAYABLE_FIELDS and v is not None
+        }
         return cls(d["role"], parts, **extra)
 
     def __repr__(self):

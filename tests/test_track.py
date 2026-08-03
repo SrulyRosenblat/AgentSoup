@@ -138,16 +138,12 @@ def test_webhook_sink_posts_events(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    # make async posts synchronous for deterministic ordering
-    monkeypatch.setattr(
-        "agentsoup.tracking.threading.Thread",
-        lambda target, daemon: type("T", (), {"start": staticmethod(target)})(),
-    )
 
     @llm(model="m")
     def ask(q: str) -> str:
         return q
 
+    # one worker thread keeps event order; terminal events flush before the block exits
     with track(track.webhook("http://x/hook", headers={"Authorization": "Bearer t"}), run_id="r1"):
         ask("hi")
 
@@ -342,3 +338,173 @@ def test_otel_sink_spans(monkeypatch):
     assert span.attrs["agentsoup.run_id"] == "r1"
     assert span.attrs["agentsoup.llm_calls"] == 1
     assert "agentsoup.duration_s" in span.attrs
+
+
+def test_sink_calling_an_llm_function_does_not_deadlock(monkeypatch, tmp_path):
+    """C1: a sink is just a function — including one that itself calls an @llm fn."""
+    _content_fake(monkeypatch, lambda t: t)
+    seen = []
+
+    @llm(model="m")
+    def label(text: str) -> str:
+        return text
+
+    @llm(model="m")
+    def work(text: str) -> str:
+        return text
+
+    def reflective_sink(event):
+        if event["event"] == "call_finished" and event["name"] == "work":
+            seen.append(label("summarize: " + str(event["output"])))
+
+    with track(reflective_sink, run_id="r1"):
+        assert work("hi") == "hi"
+    assert seen == ["summarize: hi"]  # completed without hanging
+
+
+def test_slow_sink_does_not_block_an_unrelated_run(monkeypatch, tmp_path):
+    """C2: locks are per sink instance, not global."""
+    import time as _t
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    def slow(event):
+        _t.sleep(0.3)
+
+    fast_events = []
+    durations = {}
+
+    def run_slow():
+        with track(slow, run_id="slow"):
+            ask("a")
+
+    def run_fast():
+        _t.sleep(0.05)  # start while the slow sink is mid-event
+        start = _t.monotonic()
+        with track(fast_events.append, run_id="fast"):
+            ask("b")
+        durations["fast"] = _t.monotonic() - start
+
+    t1 = threading.Thread(target=run_slow)
+    t2 = threading.Thread(target=run_fast)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert durations["fast"] < 0.25  # not serialized behind the slow sink
+    assert len(fast_events) == 4
+
+
+def test_state_file_evicts_finished_runs_and_never_resumes(monkeypatch, tmp_path):
+    """I3: no unbounded memory; reusing a run_id starts fresh."""
+    _content_fake(monkeypatch, lambda t: t)
+    sink = track.state_file(tmp_path)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    for _ in range(2):
+        with track(sink, run_id="dup"):
+            ask("hi")
+
+    state = read_state(tmp_path, "dup")
+    assert len(state["calls"]) == 1                  # not merged with the earlier run
+    assert state["usage"]["llm_calls"] == 1
+    assert sink.__closure__ is not None
+    retained = [c for c in sink.__closure__ if isinstance(c.cell_contents, dict)]
+    assert all(not c.cell_contents for c in retained)  # states dict emptied
+
+
+def test_keyboard_interrupt_marks_call_failed(monkeypatch, tmp_path):
+    """I2: BaseException must still close out the call."""
+    import litellm
+
+    def interrupt(**kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(litellm, "completion", interrupt)
+    events = []
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with pytest.raises(KeyboardInterrupt):
+        with track(events.append, run_id="r1"):
+            ask("hi")
+
+    assert [e["event"] for e in events] == ["run_started", "call_started", "call_failed", "run_failed"]
+
+
+def test_otel_spans_isolated_per_run(monkeypatch):
+    """I1: call_ids restart per run, so spans must key on (run_id, call_id)."""
+    _content_fake(monkeypatch, lambda t: t)
+    spans = []
+
+    class FakeSpan:
+        def __init__(self, name, attrs):
+            self.name, self.attrs, self.ended = name, dict(attrs), False
+
+        def set_attribute(self, k, v):
+            self.attrs[k] = v
+
+        def set_status(self, *a, **k):
+            pass
+
+        def end(self):
+            self.ended = True
+
+    class FakeTracer:
+        def start_span(self, name, attributes=None):
+            s = FakeSpan(name, attributes or {})
+            spans.append(s)
+            return s
+
+    sink = track.otel(tracer=FakeTracer())
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    def worker(run_id):
+        with track(sink, run_id=run_id):
+            ask(run_id)
+
+    t1 = threading.Thread(target=worker, args=("ra",))
+    t2 = threading.Thread(target=worker, args=("rb",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert len(spans) == 2
+    assert all(s.ended for s in spans)                       # no leaked spans
+    assert {s.attrs["agentsoup.run_id"] for s in spans} == {"ra", "rb"}
+
+
+def test_complete_response_output_records_parsed_value(monkeypatch, tmp_path):
+    """I5: don't dump a 10KB repr of the raw completion into the state file."""
+    from agentsoup import CompleteResponse
+
+    _content_fake(monkeypatch, lambda t: t)
+    events = []
+
+    @llm(model="m")
+    def ask(q: str) -> CompleteResponse[str]:
+        return q
+
+    with track(events.append, run_id="r1"):
+        ask("hi")
+
+    finished = [e for e in events if e["event"] == "call_finished"][0]
+    assert finished["output"] == "hi"
+
+
+def test_run_id_is_sanitized_for_the_filename(monkeypatch, tmp_path):
+    _content_fake(monkeypatch, lambda t: t)
+
+    @llm(model="m")
+    def ask(q: str) -> str:
+        return q
+
+    with track(track.state_file(tmp_path), run_id="a/b:c"):
+        ask("hi")
+    assert (Path(tmp_path) / "a_b_c.json").exists()

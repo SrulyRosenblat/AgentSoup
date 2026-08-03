@@ -29,7 +29,7 @@ book = recommend("octopuses")   # Book(title='...', author='...')
 
 The function body builds the prompt; the return **type hint** picks the output: `-> str` (or none) returns text, a pydantic model returns a parsed instance, and `-> CompleteResponse[T]` returns `(parsed, raw_completion)`.
 
-Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=3` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables.
+Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=3` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables. A structured response that fails validation is sent back to the model with the error so it can fix it (`repair=1` by default; `repair=0` disables).
 
 Set a default system prompt on the decorator with `system=` — it's prepended to every call, and overridden whenever the return value includes its own `system(...)` message (or via `with_options(system=...)`):
 
@@ -86,7 +86,7 @@ def assistant(question: str) -> str:
     return question
 ```
 
-Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, so agents can delegate to sub-agents with zero extra syntax. Tool schemas are generated from signatures and type hints; tool errors are fed back to the model instead of crashing.
+Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, so agents can delegate to sub-agents with zero extra syntax. Tool schemas are generated from signatures and type hints — the docstring becomes the tool description, and `Annotated[str, Field(description="...")]` documents individual parameters. Tool errors are fed back to the model instead of crashing.
 
 ## Fan out with `.map()`
 
@@ -212,7 +212,7 @@ The library owns the correctness so your sinks can be naive: sink calls are seri
 
 | | |
 |---|---|
-| `@llm(model, system=, tools=, max_turns=, retries=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
+| `@llm(model, system=, tools=, max_turns=, retries=, repair=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
 | `@agent` | alias of `@llm` — reads better when tools are involved |
 | `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
 | `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |

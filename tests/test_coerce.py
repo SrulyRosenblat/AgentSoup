@@ -128,8 +128,7 @@ def test_from_openai_format_round_trips():
         {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "http://x/a.png"}}]},
         {"role": "tool", "tool_call_id": "c1", "content": "result text"},
         {"role": "assistant", "content": None,
-         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
-         "reasoning_content": "thinking..."},
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
     ]
     for d in cases:
         m = Message.from_openai_format(d)
@@ -142,6 +141,19 @@ def test_from_openai_format_round_trips():
         for k, v in d.items():
             if k not in ("role", "content"):
                 assert out[k] == v
+
+
+def test_response_only_fields_are_not_replayed():
+    """reasoning_content/annotations come back on responses but providers reject
+    them on the way in — they must not survive into the next request."""
+    m = Message.from_openai_format({
+        "role": "assistant", "content": "hi",
+        "reasoning_content": "thinking...", "annotations": [{"x": 1}],
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+    })
+    out = m.to_openai_format()
+    assert "reasoning_content" not in out and "annotations" not in out
+    assert out["tool_calls"][0]["id"] == "c1"  # replay-safe fields kept
 
 
 def test_from_openai_format_strips_none_extras():

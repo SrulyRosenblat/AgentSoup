@@ -1,5 +1,7 @@
 import json
 
+import pydantic
+
 import pytest
 from pydantic import BaseModel
 
@@ -688,3 +690,60 @@ def test_invalid_tool_rejected_at_decoration():
 
     with pytest.raises(ValueError, match="args"):
         Tool.from_function(varargs_tool)
+
+
+def test_validation_error_is_repaired(fake_completion):
+    fake_completion.queue.append(text_response('{"value": "not a number"}'))  # bad
+    fake_completion.queue.append(text_response('{"value": 42}'))              # repaired
+
+    @llm(model="m")
+    def compute(q: str) -> Answer:
+        return q
+
+    assert compute("go") == Answer(value=42)
+    repair_prompt = fake_completion.calls[1]["messages"][-1]["content"][0]["text"]
+    assert "failed validation" in repair_prompt and "value" in repair_prompt
+
+
+def test_repair_exhausted_raises(fake_completion):
+    for _ in range(3):
+        fake_completion.queue.append(text_response('{"value": "nope"}'))
+
+    @llm(model="m", repair=1)
+    def compute(q: str) -> Answer:
+        return q
+
+    with pytest.raises(pydantic.ValidationError):
+        compute("go")
+    assert len(fake_completion.calls) == 2  # original + 1 repair
+
+
+def test_repair_zero_disables(fake_completion):
+    fake_completion.queue.append(text_response('{"value": "nope"}'))
+
+    @llm(model="m", repair=0)
+    def compute(q: str) -> Answer:
+        return q
+
+    with pytest.raises(pydantic.ValidationError):
+        compute("go")
+    assert len(fake_completion.calls) == 1
+
+
+def test_annotated_field_descriptions_reach_tool_schema():
+    from typing import Annotated
+    from pydantic import Field
+
+    def get_weather(city: Annotated[str, Field(description="City name, e.g. NYC")]) -> str:
+        """Weather."""
+        return city
+
+    props = Tool.from_function(get_weather).parameters["properties"]
+    assert props["city"]["description"] == "City name, e.g. NYC"
+
+
+def test_bare_complete_response_rejected_at_decoration():
+    with pytest.raises(ValueError, match="CompleteResponse\\[T\\]"):
+        @llm(model="m")
+        def ask(q: str) -> CompleteResponse:
+            return q

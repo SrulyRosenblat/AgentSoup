@@ -27,7 +27,7 @@ class CompleteResponse(NamedTuple, Generic[T]):
 
     parsed_response: T
     completion: object
-    messages: list = []
+    messages: tuple = ()
 
 
 class AgentMaxTurnsError(RuntimeError):
@@ -40,6 +40,8 @@ class AgentMaxTurnsError(RuntimeError):
 def _split_return_type_hint(hint) -> tuple[type | None, bool]:
     if get_origin(hint) == CompleteResponse:
         return get_args(hint)[0], True
+    if hint is CompleteResponse:
+        raise ValueError("Annotate the parsed type: CompleteResponse[T], not bare CompleteResponse")
     return hint, False
 
 
@@ -51,17 +53,21 @@ def _is_model(t) -> bool:
     return isinstance(t, type) and issubclass(t, pydantic.BaseModel)
 
 
+def _parse(content: str, return_type):
+    if return_type in (None, str):
+        return content
+    if _is_model(return_type):
+        return return_type.model_validate_json(content)
+    # list[str], dict, dataclass, ... — anything pydantic can adapt
+    return pydantic.TypeAdapter(return_type).validate_json(content)
+
+
 def _finalize(response, return_type, wants_complete, transcript=()):
     content = response.choices[0].message.content
     if content is None:
         finish = getattr(response.choices[0], "finish_reason", None)
         raise RuntimeError(f"Model returned no content (finish_reason={finish!r})")
-    if return_type in (None, str):
-        parsed = content
-    elif _is_model(return_type):
-        parsed = return_type.model_validate_json(content)
-    else:  # list[str], dict, dataclass, ... — anything pydantic can adapt
-        parsed = pydantic.TypeAdapter(return_type).validate_json(content)
+    parsed = _parse(content, return_type)
     if wants_complete:
         return CompleteResponse(parsed, response, [Message.from_openai_format(m) for m in transcript])
     return parsed
@@ -85,14 +91,15 @@ class Tool:
         target = inspect.unwrap(fn)  # see through @llm/@agent wrappers
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", target.__name__):
             raise ValueError(f"Invalid tool name {target.__name__!r} (use a named function)")
-        hints = get_type_hints(target)
+        # include_extras keeps Annotated[str, Field(description=...)] param docs in the schema
+        hints = get_type_hints(target, include_extras=True)
         hints.pop("return", None)
         fields = {}
         for name, p in inspect.signature(target).parameters.items():
             if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                 raise ValueError(f"Tool {target.__name__!r} cannot use *args/**kwargs")
             default = ... if p.default is inspect.Parameter.empty else p.default
-            fields[name] = (hints.get(name, str), default)
+            fields[name] = (hints.get(name, str), default)  # Annotated[...] metadata kept
         arg_model = pydantic.create_model(f"{target.__name__}_args", **fields)
 
         def invoke(args: dict):
@@ -185,6 +192,7 @@ def llm(
     tools: tuple = (),
     max_turns: int = 10,
     retries: int = 3,
+    repair: int = 1,
     **llm_kwargs,
 ):
     """Decorator: the wrapped function's return value becomes the prompt; its
@@ -200,7 +208,9 @@ def llm(
     function's return value includes its own system() message, which overrides it.
 
     Transient provider errors (rate limits, timeouts, connection/5xx) are retried
-    ``retries`` times with exponential backoff + jitter (0.5s doubling, 8s cap)."""
+    ``retries`` times with exponential backoff + jitter (0.5s doubling, 8s cap).
+    A structured response that fails validation is sent back to the model with
+    the error, up to ``repair`` times (default 1; 0 disables)."""
     if callable(model):  # bare @llm / @agent without parentheses
         return llm()(model)
 
@@ -258,6 +268,7 @@ def llm(
             if default_system is not None and not any(m.role == "system" for m in prompt_messages):
                 prompt_messages = [default_system, *prompt_messages]
             messages = [m.to_openai_format() for m in prompt_messages]
+            repairs = repair
             for _ in range(max_turns):
                 response = _retry_completion(retries, model=model, messages=messages, **call_kwargs)
                 _record_usage(stats, response)
@@ -266,7 +277,19 @@ def llm(
                 if not tool_calls:
                     final = msg.model_dump() if hasattr(msg, "model_dump") else {
                         "role": "assistant", "content": msg.content}
-                    return _finalize(response, return_type, wants_complete, [*messages, final])
+                    try:
+                        return _finalize(response, return_type, wants_complete, [*messages, final])
+                    except pydantic.ValidationError as e:
+                        # feed the validation error back and let the model repair it
+                        if repairs <= 0:
+                            raise
+                        repairs -= 1
+                        messages.append(final)
+                        messages.append({"role": "user", "content": [{
+                            "type": "text",
+                            "text": f"Your response failed validation. Fix these errors and reply "
+                                    f"with corrected output only:\n{e}"}]})
+                        continue
                 messages.append(msg.model_dump() if hasattr(msg, "model_dump") else msg)
                 for tc in tool_calls:
                     try:
@@ -288,7 +311,7 @@ def llm(
             stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
             try:
                 result = _invoke(args, kwargs, labeled_mcp, stats)
-            except Exception as e:
+            except BaseException as e:  # incl. KeyboardInterrupt: never leave a call "running"
                 tracker.call_failed(call_id, f.__name__, round(time.monotonic() - started, 3), e, stats)
                 raise
             tracker.call_finished(call_id, f.__name__, round(time.monotonic() - started, 3), result, stats)
@@ -326,7 +349,7 @@ def llm(
         wrapper.map = map_
         wrapper.with_options = lambda **overrides: llm(
             **{"model": model, "system": system, "tools": tools, "max_turns": max_turns,
-               "retries": retries, **llm_kwargs, **overrides}
+               "retries": retries, "repair": repair, **llm_kwargs, **overrides}
         )(f)
         return wrapper
 

@@ -1,7 +1,7 @@
 """Deep research: plan -> fan out search agents -> sometimes dig deeper -> synthesize.
 
 Run:  OPENAI_API_KEY=... python examples/deep_research.py "octopus intelligence"
-Watch from another terminal:  python -c "from agentsoup import load_run; import sys, json; print(json.dumps(load_run(sys.argv[1]), indent=2))" .agentsoup/runs/<run_id>.json
+Watch from another terminal:  python -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))" .agentsoup/runs/<run_id>.json
 """
 import sys
 
