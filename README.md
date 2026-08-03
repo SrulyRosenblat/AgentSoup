@@ -1,149 +1,233 @@
-
-
 # 🥣 AgentSoup
 
 **Mix prompts, models, and logic — cook up LLM-powered functions with ease.**
 
-AgentSoup is a lightweight Python library for turning regular functions into structured, prompt-driven LLM tools. It’s flexible enough for creative or structured outputs, while keeping your code readable and maintainable.
+Write a Python function, return the prompt, get back a typed result. AgentSoup turns functions into LLM calls, agents with tools, and trackable pipelines — all with the same tiny interface.
 
-## Installation
-
-```
+```bash
 pip install agentsoup
 ```
 
-> ✨ Built on top of [`litellm`](https://github.com/BerriAI/litellm), `pydantic`, and composable message objects.
+Works with any provider [litellm](https://docs.litellm.ai) supports (OpenAI, Anthropic, Gemini, …) — set the matching API key env var and pass the model name.
 
----
-
-## 🧠 Why AgentSoup?
-
-* 🥄 **Simple to start** – just decorate a function and return a prompt.
-* 🍲 **Structured responses** – get fully typed outputs using `pydantic`.
-* 🔬 **Complete response mode** – get raw completions *and* parsed data.
-* 🧩 **Composable messages** – use structured message types for flexibility.
-* 🔄 **Model-flexible** – works with OpenAI, Gemini, Mistral, Claude, and more via `litellm`.
-
----
-
-## 📘 Example 1: Sorting Books
+## The idea: return the prompt
 
 ```python
-from pydantic import BaseModel
 from agentsoup import llm
+from pydantic import BaseModel
 
 class Book(BaseModel):
     title: str
+    author: str
 
-class BooksList(BaseModel):
-    books: list[Book]
+@llm(model="gpt-4.1")
+def recommend(topic: str) -> Book:
+    return f"Recommend one great book about {topic}"
 
-@llm(model="gpt-4o-mini")
-def sort_books_by_popularity(book_list: list[str]) -> BooksList:
-    """
-    Sorts books by popularity.
-    """
-    return 'sort the following books by popularity {book_list}'
+book = recommend("octopuses")   # Book(title='...', author='...')
+```
 
-# Call it like a regular function:
-result = sort_books_by_popularity([
-    'The Great Gatsby', 'To Kill a Mockingbird', '1984',
-    'Pride and Prejudice', 'The Hobbit'
+The function body builds the prompt; the return **type hint** picks the output: `-> str` (or none) returns text, a pydantic model returns a parsed instance, and `-> CompleteResponse[T]` returns `(parsed, raw_completion)`.
+
+Transient provider errors (rate limits, timeouts, connection/5xx) are retried automatically with exponential backoff and jitter — `retries=3` by default, tune per function (`retries=5`) or per call site via `with_options`; `retries=0` disables. A structured response that fails validation is sent back to the model with the error so it can fix it (`repair=1` by default; `repair=0` disables).
+
+Set a default system prompt on the decorator with `system=` — it's prepended to every call, and overridden whenever the return value includes its own `system(...)` message (or via `with_options(system=...)`):
+
+```python
+@llm(model="gpt-4.1", system="You are a terse librarian.")
+def recommend(topic: str) -> Book:
+    return f"Recommend one great book about {topic}"
+```
+
+Any decorated function can be re-tuned without re-defining it — `with_options` returns a copy with merged parameters (any litellm kwarg; on agents also `tools`, `mcp_servers`, `max_turns`):
+
+```python
+cheap = recommend.with_options(model="gpt-4.1-mini", temperature=0)
+cheap("octopuses")
+```
+
+## Multimodal: just return the pieces
+
+Strings, `pathlib.Path`s, and media URLs mix freely in a returned tuple — each becomes the right content part automatically (images, video, audio, PDFs; MIME type detected from the file). Local files must be `Path` objects — bare strings are always sent as text, never sniffed for file paths:
+
+```python
+from pathlib import Path
+from agentsoup import llm, system
+
+@llm(model="gemini/gemini-2.5-flash")
+def analyze(img: str, clip: str) -> str:
+    return "Compare this photo and video:", Path(img), Path(clip)
+
+@llm(model="gpt-4.1")
+def summarize_pdf(url: str) -> str:
+    return system("You are terse."), "Summarize:", url   # e.g. https://x.com/doc.pdf
+```
+
+Explicit part/message types (`Text`, `Image`, `Video`, `Audio`, `File`, `system(...)`, `user(...)`, `assistant(...)`) are there when you want control — each media class takes a local path or URL.
+
+## Agents: the same decorator, plus tools
+
+There is exactly one decorator — `@agent` is an alias of `@llm`. Add `tools=` and the model can call them in a loop until it has an answer. A tool is any typed Python function with a docstring:
+
+```python
+from agentsoup import agent
+
+def get_weather(city: str, units: str = "c") -> str:
+    """Look up current weather for a city."""
+    ...
+
+@llm(model="gpt-4.1-mini")
+def summarize(text: str) -> str:
+    """Summarize text in two sentences."""
+    return f"Summarize: {text}"
+
+@agent(model="gpt-4.1", tools=[get_weather, summarize], max_turns=10)
+def assistant(question: str) -> str:
+    return question
+```
+
+Note `summarize`: **`@llm` and `@agent` functions are themselves valid tools**, so agents can delegate to sub-agents with zero extra syntax. Tool schemas are generated from signatures and type hints — the docstring becomes the tool description, and `Annotated[str, Field(description="...")]` documents individual parameters. Tool errors are fed back to the model instead of crashing.
+
+## Fan out with `.map()`
+
+Every decorated function has `.map(items)` — one call per item, all in parallel, results in order. Because the function body is plain Python that runs before the LLM call, fan-out-and-summarize fits in one function:
+
+```python
+@llm(model="gpt-4.1-mini")
+def summarize(chunk: str) -> str:
+    return "Summarize:", chunk
+
+@llm(model="gpt-4.1")
+def report(chunks) -> str:
+    return "Combine these summaries:", summarize.map(chunks)   # parallel fan-out, then one final call
+```
+
+`.map()` works the same on agents with tools (MCP sessions are opened once and shared across the whole map), and extra kwargs are forwarded to every call: `summarize.map(chunks, style="terse")`. Control it with `max_workers=` (cap concurrency for rate limits) and `return_exceptions=True` (a failed item yields its exception instead of cancelling the rest).
+
+## MCP servers
+
+MCP servers go in the **same `tools=` list** — as a URL string, a command string, or a config object when you need headers/env:
+
+```python
+from agentsoup import agent, HTTPServer
+
+@agent(model="gpt-4.1", tools=[
+    get_weather,                                              # python function
+    "npx -y @modelcontextprotocol/server-filesystem ./docs",  # stdio MCP server
+    "https://mcp.example.com/mcp",                            # HTTP MCP server
+    HTTPServer("https://mcp.linear.app/mcp", headers={"Authorization": "Bearer ..."}),
 ])
-print(result)
+def helper(task: str) -> str:
+    return "Complete this task using the available tools:", task
 ```
 
----
+The model sees MCP tools and Python tools identically; a name collision with one of your Python tools is resolved by prefixing the MCP tool with its server label. Sessions connect when the function is called and tear down when it returns (one shared session for a whole `.map`). Set `timeout=` on a server config for long-running tools.
 
-## 🖼️ Example 2: Image Captioning with Full Response
+## Pipelines and subagents are just functions
+
+There is no pipeline framework. A pipeline is a function that calls other functions; a subagent is an `@llm` function called by another (directly in the body, or handed to the model via `tools=`); parallelism is `.map()`:
 
 ```python
-from pydantic import BaseModel
-from agentsoup import llm, UserMessage, Text, LocalImage, CompleteResponse
-
-class ImageDescription(BaseModel):
-    caption: str
-    long_description: str
-
-@llm(model="gpt-4o-mini")
-def describe_image(path: str) -> CompleteResponse[ImageDescription]:
-    """
-    Describes an image.
-    """
-    return [
-        UserMessage(
-            content=[
-                Text('describe the following image:'),
-                LocalImage(image_path=path)
-            ]
-        )
-    ]
-
-response = describe_image('./penguin.jpeg')
-print("Caption:", response.parsed_response.caption)
-print("Description:", response.parsed_response.long_description)
-print("Tokens used:", response.completion.usage.total_tokens)
-
+def write_article(topic):                       # the whole pipeline
+    o = outline(topic)
+    sections = draft_section.map(plan(o))       # fan out
+    return edit(sections)                       # fan in
 ```
 
----
+## Chat is a list
 
-## 🧪 Example 3: Regex Generator with Gemini
+No session or context objects — history is a plain list you own, and you never need to build messages by hand. Splat the history into the returned tuple (the trailing loose value becomes the new user message), and take the next history from `resp.messages` — the call's full transcript, including reasoning, tool calls, and tool results:
 
 ```python
-import re
-from pydantic import BaseModel
-from agentsoup import llm
+from agentsoup import agent, CompleteResponse
 
-class Regex(BaseModel):
-    regex_str: str
+@agent(model="gpt-4.1", tools=[search], system="You are a research assistant.")
+def turn(history, msg: str) -> CompleteResponse[str]:
+    return *history, msg
 
-@llm(model="gemini-2.5-flash")
-def build_regex(text: str) -> Regex:
-    """
-    Builds a regex from a text description.
-    """
-    return f'give regex that does the following: {text}'
-
-text_blob = """
-poe 435-435-4354
-holmes (435) 435-4354
-bob 435.435.4354
-"""
-
-regex = build_regex('extracts all phone numbers from a text in any format').regex_str
-print("Generated Regex:", regex)
-print("Matches:", re.findall(regex, text_blob))
+history = []
+while (msg := input("> ")):
+    resp = turn(history, msg)
+    print(resp.parsed_response)
+    history = resp.messages     # next turn continues with everything the model saw and did
 ```
 
----
+The explicit message helpers (`user(...)`, `assistant(...)`, `system(...)`) exist for when you want manual control — few-shot examples, editing or compacting history, or a lighter history that keeps only `[user(msg), assistant(answer)]` pairs and drops tool traffic.
 
-## 📦 Message Types (Optional)
+Windowing is `history[-20:]`; branching a conversation is copying the list (`turn.map` over variants works too); persistence is `json.dumps([m.to_openai_format() for m in history])` and back via `Message.from_openai_format`. Structured outputs mid-conversation just work — `assistant(some_pydantic_obj)` serializes it as JSON.
 
-AgentSoup supports structured message composition via:
+## Validation is just a loop
 
-* `UserMessage`
-* `SystemMessage`
-* `Text`
-* `LocalImage`
-* and more..
+There is no requirements/verifier framework either — a judge is just another `@llm` function, and validate-and-repair is a `for` loop:
 
-This allows full control over the message content while keeping function logic clean and focused.
+```python
+class Verdict(BaseModel):
+    passed: bool
+    feedback: str
 
----
+@llm(model="gpt-4.1-mini")
+def judge(draft: str, rules: str) -> Verdict:
+    return f"Check this draft against the rules: {rules}", draft
 
-## 🧠 Coming Soon
+def reliable_write(topic, rules, budget=3):
+    feedback = ""
+    for _ in range(budget):
+        draft = write(topic, feedback)
+        verdict = judge(draft, rules)
+        if verdict.passed:
+            return draft
+        feedback = verdict.feedback
+    return draft
+```
 
-* 🕵️ Agent mode for goal-driven agents
-* 🧰 Tool & plugin support
-* 🔁 Streaming + iterative refinement modes
-* 🧠 Full Documentation
+Deterministic checks are an `if`; a judge panel is `judge.map(...)`; best-of-N is `write.map([topic] * 5)` plus picking the winner; escalation is `write.with_options(model=...)` on the last attempt.
 
----
+## Tracking: a sink is just a function
 
-## 📜 License
+Wrap any code in `track()` and every `@llm`/`@agent` call inside — nested, parallel, agent-in-agent — emits a plain JSON-serializable event dict to your sinks. A sink is any callable taking one dict:
 
-MIT
+```python
+from agentsoup import track
 
+with track() as run_id:                        # default sink: track.state_file(".agentsoup/runs")
+    write_article("octopus intelligence")
 
+with track(track.state_file("runs/"),          # combine any sinks
+           track.webhook("https://example.com/hook", headers={"Authorization": "Bearer ..."}),
+           track.otel()):                      # pip install agentsoup[otel]
+    write_article(topic)
 
+with track(print): ...                         # instant debugger
+events = []
+with track(events.append): ...                 # capture for tests/analysis
+```
+
+Events: `run_started` / `call_started` / `call_finished` / `call_failed` / `run_finished` (or `run_failed`), each carrying `run_id`, `time`, and for calls: `call_id`, `name`, `duration_s`, `output` or `error`, and `usage` (LLM calls, prompt/completion tokens, estimated USD cost).
+
+The shipped sinks hang off `track` itself: `track.state_file(dir)` maintains `<dir>/<run_id>.json` — a full snapshot rewritten atomically after every event (with run-level usage totals), so another process can watch live with `json.loads(path.read_text())`; `track.webhook(url, headers=)` POSTs each event (terminal events block so process exit can't drop them); `track.otel()` opens one OpenTelemetry span per call with usage/cost attributes, feeding whatever tracer provider you've configured.
+
+The library owns the correctness so your sinks can be naive: sink calls are serialized under a lock (safe under `.map` fan-out), the active tracker is context-local (concurrent runs in different threads stay isolated; nested blocks restore the outer), and a sink that raises is disabled with a logged warning — tracking can never fail the run.
+
+## API summary
+
+| | |
+|---|---|
+| `@llm(model, system=, tools=, max_turns=, retries=, repair=, **litellm_kwargs)` | the one decorator: return value → prompt, return hint → output type, `tools=` → agent loop |
+| `@agent` | alias of `@llm` — reads better when tools are involved |
+| `tools=[...]` | functions, `@llm` functions, `Tool` objects, MCP servers (config, URL, or command string) — all in one list |
+| `StdioServer` / `HTTPServer` | MCP server configs, for when you need headers/env |
+| `track(*sinks, run_id=)` | emit every call in a block as event dicts; a sink is any callable |
+| `track.state_file(dir)` / `track.webhook(url, headers=)` / `track.otel()` | shipped sinks: live JSON snapshot, HTTP push, OpenTelemetry spans |
+| `Text`, `Image`, `Video`, `Audio`, `File`, `system/user/assistant` | explicit content when you want it |
+| `CompleteResponse[T]` | also get the raw completion + full transcript (`.messages`) for full-context continuation |
+| `fn.map(items, **kwargs)` | call once per item, in parallel; ordered list of results |
+| `fn.with_options(**overrides)` | copy of a decorated function with changed parameters |
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+MIT licensed.

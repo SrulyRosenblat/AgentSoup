@@ -1,0 +1,244 @@
+"""Tracking: every @llm/@agent call inside a `with track():` block emits plain
+JSON-serializable event dicts to sinks. A sink is any callable taking one dict —
+`print` works, `events.append` works, and the library ships three:
+state_file() (atomic live-readable JSON snapshot), webhook() (POST per event),
+and otel() (one OpenTelemetry span per call).
+
+The library owns the correctness: the active tracker is context-local (nested
+blocks restore the outer; threads and .map workers stay isolated), sink calls
+are serialized under one lock so naive sinks are safe under parallel fan-out,
+and a sink that raises is disabled with a logged warning — tracking can never
+fail the run."""
+import contextlib
+import contextvars
+import json
+import logging
+import os
+import queue as _queue
+import re
+import secrets
+import threading
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pydantic
+
+_current: contextvars.ContextVar = contextvars.ContextVar("agentsoup_track", default=None)
+_logger = logging.getLogger("agentsoup")
+
+# One RLock per sink *instance*, shared across trackers: serializes a sink so
+# naive sinks are safe under .map fan-out and across concurrent runs, without
+# one slow sink (or run) blocking unrelated ones. RLock so a sink that itself
+# calls a decorated function re-enters cleanly instead of deadlocking.
+_sink_locks: dict = {}
+_registry_lock = threading.Lock()
+
+
+def _lock_for(sink) -> threading.RLock:
+    with _registry_lock:
+        return _sink_locks.setdefault(id(sink), threading.RLock())
+
+
+def current_tracker() -> "_Tracker | None":
+    """The active tracker in this context, if any (used by the decorators)."""
+    return _current.get()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _jsonable(value):
+    if isinstance(value, pydantic.BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, tuple) and hasattr(value, "parsed_response"):
+        return _jsonable(value.parsed_response)  # CompleteResponse: record the parsed result
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return repr(value)[:10_000]
+
+
+class _Tracker:
+    def __init__(self, sinks, run_id: str):
+        self.run_id = run_id
+        self.sinks = [(sink, _lock_for(sink)) for sink in sinks]
+        self._id_lock = threading.Lock()
+        self._next_id = 0
+
+    def emit(self, event: str, **fields):
+        e = {"event": event, "run_id": self.run_id, "time": _now(), **fields}
+        for i, (sink, lock) in enumerate(self.sinks):
+            if sink is None:
+                continue
+            try:
+                with lock:
+                    sink(e)
+            except Exception:
+                self.sinks[i] = (None, lock)  # tracking must never fail the run
+                _logger.warning("agentsoup sink disabled after error: %r", sink, exc_info=True)
+
+    def call_started(self, name: str) -> int:
+        with self._id_lock:
+            call_id = self._next_id
+            self._next_id += 1
+        self.emit("call_started", call_id=call_id, name=name)
+        return call_id
+
+    def call_finished(self, call_id: int, name: str, duration_s: float, output, usage: dict):
+        self.emit("call_finished", call_id=call_id, name=name, duration_s=duration_s,
+                  output=_jsonable(output), usage=usage)
+
+    def call_failed(self, call_id: int, name: str, duration_s: float, error: BaseException, usage: dict):
+        self.emit("call_failed", call_id=call_id, name=name, duration_s=duration_s,
+                  error=f"{type(error).__name__}: {error}", usage=usage)
+
+
+@contextlib.contextmanager
+def track(*sinks, run_id: str | None = None):
+    """`with track(*sinks) as run_id:` — emit every decorated call in the block
+    as event dicts to the sinks. No sinks given -> state_file() by default."""
+    run_id = run_id or f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    tracker = _Tracker(sinks or (state_file(),), run_id)
+    token = _current.set(tracker)
+    tracker.emit("run_started")
+    try:
+        yield run_id
+    except BaseException as e:
+        tracker.emit("run_failed", error=f"{type(e).__name__}: {e}")
+        raise
+    else:
+        tracker.emit("run_finished")
+    finally:
+        _current.reset(token)  # restore any outer run, don't clear it
+
+
+def state_file(state_dir=".agentsoup/runs"):
+    """Sink: maintain <state_dir>/<run_id>.json — a full snapshot, atomically
+    rewritten after every event (statuses, timings, outputs, errors, per-call
+    usage, run totals) — readable live from any other process."""
+    states: dict = {}
+
+    def _call(state, call_id):
+        while len(state["calls"]) <= call_id:
+            state["calls"].append({
+                "name": None, "status": "pending", "started_at": None, "finished_at": None,
+                "duration_s": None, "output": None, "error": None, "usage": None,
+            })
+        return state["calls"][call_id]
+
+    def sink(e: dict):
+        event = e["event"]
+        fresh = {
+            "run_id": e["run_id"], "status": "running", "created_at": e["time"],
+            "updated_at": e["time"],
+            "usage": {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
+            "calls": [],
+        }
+        if event == "run_started":
+            states[e["run_id"]] = fresh  # never resume a finished run of the same id
+        state = states.setdefault(e["run_id"], fresh)
+        if event == "call_started":
+            _call(state, e["call_id"]).update(name=e["name"], status="running", started_at=e["time"])
+        elif event in ("call_finished", "call_failed"):
+            _call(state, e["call_id"]).update(
+                name=e["name"], status="done" if event == "call_finished" else "failed",
+                finished_at=e["time"], duration_s=e["duration_s"],
+                output=e.get("output"), error=e.get("error"), usage=e.get("usage"),
+            )
+            totals = state["usage"]
+            for key, value in (e.get("usage") or {}).items():
+                totals[key] = round(totals.get(key, 0) + value, 6)
+        elif event == "run_finished":
+            state["status"] = "done"
+        elif event == "run_failed":
+            state["status"] = "failed"
+        state["updated_at"] = e["time"]
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", e["run_id"])
+        path = Path(state_dir) / f"{safe_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, default=str))
+        os.replace(tmp, path)  # atomic: readers never see a partial doc
+        if event in ("run_finished", "run_failed"):
+            states.pop(e["run_id"], None)  # don't retain finished runs in memory
+
+    return sink
+
+
+def webhook(url: str, headers: dict | None = None, timeout: float = 3.0):
+    """Sink: POST each event as JSON on a single background worker thread, so
+    events keep their order and a slow endpoint never blocks the run. Terminal
+    events (run_finished/run_failed) are flushed before the block exits."""
+    queue: "_queue.Queue" = _queue.Queue()
+
+    def worker():
+        while True:
+            e = queue.get()
+            try:
+                req = urllib.request.Request(
+                    url, data=json.dumps(e, default=str).encode(),
+                    headers={"Content-Type": "application/json", **(headers or {})},
+                )
+                urllib.request.urlopen(req, timeout=timeout)
+            except Exception:
+                pass  # delivery is best-effort
+            finally:
+                queue.task_done()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def sink(e: dict):
+        queue.put(e)
+        if e["event"] in ("run_finished", "run_failed"):
+            queue.join()  # flush outside any sink lock: process exit can't drop it
+
+    return sink
+
+
+def otel(tracer=None):  # noqa: D103 — attached below as track.otel
+    """Sink: one OpenTelemetry span per call, with usage/cost as attributes.
+    Uses the globally configured tracer provider unless tracer= is given.
+    Requires opentelemetry-api (pip install agentsoup[otel])."""
+    if tracer is None:
+        from opentelemetry import trace
+
+        tracer = trace.get_tracer("agentsoup")
+    spans: dict = {}
+
+    def sink(e: dict):
+        event = e["event"]
+        key = (e["run_id"], e.get("call_id"))  # call_ids restart per run
+        if event == "call_started":
+            spans[key] = tracer.start_span(
+                e["name"], attributes={"agentsoup.run_id": e["run_id"], "agentsoup.call_id": e["call_id"]}
+            )
+        elif event in ("run_finished", "run_failed"):
+            for k in [k for k in spans if k[0] == e["run_id"]]:  # never leak an unfinished span
+                spans.pop(k).end()
+        elif event in ("call_finished", "call_failed"):
+            span = spans.pop(key, None)
+            if span is None:
+                return
+            span.set_attribute("agentsoup.duration_s", e["duration_s"])
+            for key, value in (e.get("usage") or {}).items():
+                span.set_attribute(f"agentsoup.{key}", value)
+            if event == "call_failed":
+                span.set_attribute("agentsoup.error", e["error"])
+                try:
+                    from opentelemetry.trace import Status, StatusCode
+
+                    span.set_status(Status(StatusCode.ERROR, e["error"]))
+                except Exception:
+                    pass
+            span.end()
+
+    return sink
+
+
+# the sinks hang off track itself: track.state_file(), track.webhook(), track.otel()
+track.state_file = state_file
+track.webhook = webhook
+track.otel = otel

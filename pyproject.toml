@@ -4,16 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentsoup"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mix prompts, models, and logic — cook up LLM-powered functions with ease."
 readme = {file = "README.md", content-type = "text/markdown"}
 authors = [{name = "Sruly Rosenblat", email = "SrulyRosenblat@gmail.com"}]
 license = {text = "MIT"}
-requires-python = ">=3.8"
-dependencies = [
-    "litellm",
-    "pydantic",
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
 ]
+dependencies = [
+    "litellm>=1.95,<2",
+    "pydantic>=2,<3",
+    "mcp>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+otel = ["opentelemetry-api>=1.20"]
 
 [project.urls]
 Homepage = "https://github.com/SrulyRosenblat/AgentSoup"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agentsoup = ["py.typed"]
